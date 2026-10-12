@@ -46,6 +46,16 @@ const casU = async (undo, t, id, old, patch) => { await cas(t, id, old, patch); 
 const del = async (t, id) => {
   if (!(await ok(supabase.from(t).delete().eq("id", id).select("id"))).length) throw new Error("No se pudo eliminar: sin permiso o ya no existe.");
 };
+/* Diagnóstico de supabase.functions.invoke: HttpError (status + cuerpo), RelayError, FetchError (red/CORS/no desplegada) */
+const fnErrInfo = async (error) => {
+  const info = { tipo: error && error.name, mensaje: error && error.message };
+  const res = error && error.context;
+  if (res && typeof res.status === "number") {
+    info.status = res.status; info.statusText = res.statusText;
+    try { info.cuerpo = await res.clone().text(); try { info.json = JSON.parse(info.cuerpo); } catch { /* no era JSON */ } } catch { /* sin cuerpo */ }
+  } else if (res) info.causa = String((res && res.message) || res);
+  return info;
+};
 const isAuthErr = (e) => /jwt|jws|token/i.test(String((e && e.message) || "")) || /^PGRST30/.test((e && e.code) || "");
 
 /* ───────── Fila de la base ⇄ forma que usa la interfaz ───────── */
@@ -847,7 +857,7 @@ function LoginScreen({ emps, onSubmit }) {
     const r = await onSubmit(sel, v);
     setBusy(false);
     if (r && !r.ok) { 
-      setErr({ motivo: r.motivo, left: r.intentos_restantes, until: r.bloqueado_hasta ? Date.parse(r.bloqueado_hasta) : 0 }); 
+      setErr({ motivo: r.motivo, detalle: r.detalle, left: r.intentos_restantes, until: r.bloqueado_hasta ? Date.parse(r.bloqueado_hasta) : 0 }); 
       setPin(""); 
       setNow(Date.now()); 
     }
@@ -860,7 +870,7 @@ function LoginScreen({ emps, onSubmit }) {
   };
   const msg = !err ? null : locked ? `Demasiados intentos. Probá de nuevo en ${secs} s.`
     : err.motivo === "pin_incorrecto" ? `PIN incorrecto. Te quedan ${err.left} intentos.`
-    : err.motivo === "red" ? "No se pudo conectar. Revisá la conexión e intentá de nuevo."
+    : err.motivo === "red" ? `No se pudo conectar. Revisá la conexión e intentá de nuevo.${err.detalle ? ` (${err.detalle})` : ""}`
     : "No se pudo iniciar sesión. Intentá de nuevo.";
   return (
     <div className="min-h-screen text-white md:flex md:items-center md:justify-center" style={{ background: "#0F0F0F", fontFamily: FONT }}>
@@ -1849,12 +1859,19 @@ export default function App({ initialTab = "gen" }) {
     let r;
     try {
       const { data, error } = await supabase.functions.invoke("login-pin", { body: { empleado_id: id, pin } });
-      if (error || !data) { console.error("[login-pin]", error || "respuesta vacía"); return { ok: false, motivo: "red" }; }
+      if (error) {
+        const info = await fnErrInfo(error);
+        console.error("[login-pin] la Edge Function devolvió error:", info, error);
+        if (info.json && info.json.ok === false) return info.json; // p. ej. 401/403 con { ok:false, motivo:"pin_incorrecto" }
+        return { ok: false, motivo: "red", detalle: info.status ? `HTTP ${info.status}` : info.tipo || "sin respuesta" };
+      }
+      if (!data) { console.error("[login-pin] respuesta vacía (data = null/undefined)"); return { ok: false, motivo: "red", detalle: "respuesta vacía" }; }
+      console.debug("[login-pin] respuesta:", { ok: data.ok, motivo: data.motivo, tieneToken: !!data.token, empleado_id: data.empleado_id });
       r = data;
-    } catch (e) { console.error("[login-pin]", e); return { ok: false, motivo: "red" }; }
+    } catch (e) { console.error("[login-pin] excepción al invocar:", e); return { ok: false, motivo: "red", detalle: (e && e.name) || "excepción" }; }
     if (!r.ok) return r;
     TOKEN = r.token; supabase.realtime.setAuth(r.token);
-    try { await refresh(); } catch (e) { console.error("[login] no se pudieron cargar los datos:", e); TOKEN = null; return { ok: false, motivo: "red" }; }
+    try { await refresh(); } catch (e) { console.error("[login] el PIN fue válido pero falló la carga de datos:", e); TOKEN = null; return { ok: false, motivo: "red", detalle: "carga de datos: " + ((e && (e.code || e.message)) || "error") }; }
     const s = { id: r.empleado_id, token: r.token, exp: r.exp, day: dayKey() }; // empleado_id = uuid real
     save("session", s); setSession(s); resetUi(); setBoot("ready");
     note("inició turno.", { eid: r.empleado_id, u: r.nombre }).then(bg);
