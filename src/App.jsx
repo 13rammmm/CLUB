@@ -1,5 +1,5 @@
 import { useState, useId, useEffect, useRef, useCallback } from "react";
-// import { createClient } from "https://esm.sh/@supabase/supabase-js@2"; // MODO LOCAL: desactivado
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"; // MODO LOCAL: desactivado
 import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2 } from "lucide-react";
 
 /* ═════ MODO LOCAL / MOCK ═════
