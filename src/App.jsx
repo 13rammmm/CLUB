@@ -766,7 +766,7 @@ function MemberSheet({ m, onPay, onSaveAddr, onDelete, onClose }) {
           </div>
         ))}
       </div>
-      <div className="mt-6"><DeleteBtn onDelete={onDelete}>Eliminar socio</DeleteBtn></div>
+      <div className="mt-6"><DeleteBtn onClick={() => onDelete(m.id)}>Eliminar socio</DeleteBtn></div>
       </div>
       </div>
     </Sheet>
@@ -2254,7 +2254,7 @@ export default function App({ initialTab = "gen" }) {
       {sheet && sheet.k === "out" && ss && <OutSheet strain={ss} members={members} avail={availOf(ss.id)} onConfirm={(g, mid, paid) => doOut(ss.id, mid, g, paid)} onClose={close} />}
       {sheet && sheet.k === "merma" && ss && <MermaSheet strain={ss} avail={availOf(ss.id)} onConfirm={(g, why) => doMerma(ss.id, g, why)} onClose={close} />}
       {sheet && sheet.k === "ingreso" && ss && <IngresoSheet strain={ss} onConfirm={(g, lote) => doIngreso(ss.id, g, lote)} onClose={close} />}
-      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={() => setConfirm({ k: "member", id: sm.id })} onClose={close} />}
+      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={(id) => setConfirm({ k: "member", id })} onClose={close} />}
       {sheet && sheet.k === "new" && <OrderSheet strains={strains} members={members} avail={availOf} onConfirm={newOrder} onClose={close} />}
       {sheet && sheet.k === "add" && <OrderSheet strains={strains} members={members} avail={availOf} orderId={sheet.oid} onConfirm={(v) => addItem(sheet.oid, v)} onClose={close} />}
       {sheet && sheet.k === "session" && <SessionSheet me={me} onLogout={doLogout} onClose={close} />}
