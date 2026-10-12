@@ -1,43 +1,15 @@
 import { useState, useId, useEffect, useRef, useCallback } from "react";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"; // MODO LOCAL: desactivado
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2 } from "lucide-react";
 
-/* ═════ MODO LOCAL / MOCK ═════
-   Supabase queda reemplazado por un stub no-op: ninguna llamada sale a la red (cero 401 en consola).
-   Para volver a la base real: descomentá el import de arriba y el bloque ORIGINAL de abajo, y borrá el stub. */
-const LOCAL = false;
-const LOCAL_TOKEN = "token-local-dev-ok";
-const LOCAL_EMP = { id: 1, name: "Admin (Local)", role: "Administrador", kind: "warrior", admin: true };
-const LOCAL_SESSION = { id: 1, name: "Admin (Local)", token: LOCAL_TOKEN, exp: Math.floor(Date.now() / 1000) + 86400 * 365, day: null };
-const mockData = () => ({ emps: [LOCAL_EMP], strains: [], members: [], pack: [], orders: [], tasks: [], log: [] });
-let TOKEN = LOCAL_TOKEN;
-
-/* Query encadenable y "esperable": cualquier .select/.eq/.order/... devuelve la misma query y al await resuelve { data, error: null } */
-const noopQuery = () => {
-  const res = { data: [{ id: Date.now() }], error: null };
-  const q = new Proxy(function () {}, {
-    get: (_, p) => p === "then" ? (f, r) => Promise.resolve(res).then(f, r)
-      : p === "single" || p === "maybeSingle" ? () => Promise.resolve({ data: res.data[0], error: null })
-      : () => q,
-    apply: () => q,
-  });
-  return q;
-};
-const supabase = {
-  from: () => noopQuery(),
-  rpc: () => noopQuery(),
-  channel: () => { const ch = { on: () => ch, subscribe: () => ch }; return ch; },
-  removeChannel: () => {},
-  realtime: { setAuth: () => {} },
-  functions: { invoke: async () => ({ data: { ok: true }, error: null }) },
-};
-
-/* ORIGINAL (desactivado en modo local)
+/* ═════════════ SUPABASE ═════════════
+   La clave "publishable" es pública por diseño: la seguridad real la dan las políticas RLS.
+   Tras ingresar el PIN, la Edge Function "login-pin" devuelve un JWT con el claim empleado_id;
+   `accessToken` lo inyecta en cada consulta (REST, Realtime y funciones). Sin sesión (TOKEN = null) usa la clave anónima. */
 const SB_URL = "https://ijamykdaxesqnqzvibsd.supabase.co";
 const SB_KEY = "sb_publishable_GmFk8lElJTjof9PgQ6Rjzw_XS4Byh0F";
 let TOKEN = null;
-const supabase = createClient(SB_URL, SB_KEY, { auth: { persistSession: false }, global: { headers: { "x-client-info": "local-dev" } } });
-*/
+const supabase = createClient(SB_URL, SB_KEY, { accessToken: async () => TOKEN });
 
 /* Único dato local: el JWT del turno y el día. Nunca se guardan PIN ni datos del club. */
 const STORE = "clubops:v2:";
@@ -49,7 +21,16 @@ const save = (name, value) => {
 };
 
 /* Consultas: lanzan el error en vez de devolverlo, así cada acción se maneja con try/catch */
-const ok = async (q) => { const { data, error } = await q; if (error) throw error; return data; };
+const ok = async (q) => {
+  const { data, error } = await q;
+  if (error) { console.error("[Supabase]", error.code, error.message, error.details || "", error.hint || ""); throw error; } // lo muestra `fail` como aviso en pantalla
+  return data;
+};
+/* UPDATE que no pasa en silencio: con RLS un update bloqueado devuelve 0 filas y NO error, así que se exige al menos una fila afectada */
+const upd = async (t, id, patch) => {
+  const rows = await ok(supabase.from(t).update(patch).eq("id", id).select("id"));
+  if (!rows || !rows.length) throw new Error("No se pudo guardar: sin permiso o el registro ya no existe.");
+};
 /* Compare-and-swap: solo escribe si el valor sigue siendo el que vio este dispositivo (evita pisar a otro empleado) */
 const cas = async (table, id, old, patch) => {
   let q = supabase.from(table).update(patch).eq("id", id);
@@ -108,8 +89,27 @@ const fromLog = (r, kinds) => {
   };
 };
 
-/* MODO LOCAL: devuelve datos mock en memoria (antes leía todas las tablas de Supabase) */
-const loadAll = async () => mockData(); // MODO LOCAL: sin red
+/* Lee todas las tablas en paralelo y las entrega ya con la forma de la interfaz */
+const loadAll = async () => {
+  const rows = (t, sel, f = (q) => q) => ok(f(supabase.from(t).select(sel)));
+  const [E, G, S, MV, I, P, T, L] = await Promise.all([
+    rows("empleados", EMP_COLS, (q) => q.order("created_at").order("nombre")),
+    rows("geneticas", "*", (q) => q.order("id")),
+    rows("socios", "*", (q) => q.order("id")),
+    rows("socio_movimientos", "*", (q) => q.order("creado_en", { ascending: false }).limit(1000)),
+    rows("inventario", "*", (q) => q.order("id")),
+    rows("pedidos", "*", (q) => q.order("id", { ascending: false })),
+    rows("tareas", "*", (q) => q.order("id")),
+    rows("audit_log", "*", (q) => q.order("timestamp", { ascending: false }).limit(500)),
+  ]);
+  const emps = E.map(fromEmp), kinds = {}, movs = {};
+  emps.forEach((e) => { kinds[e.id] = e.kind; kinds[e.name] = e.kind; });
+  MV.forEach((r) => (movs[r.socio_id] ||= []).push({ t: fmtWhen(r.creado_en), txt: r.descripcion, amt: num(r.monto) }));
+  return {
+    emps, strains: G.map(fromStrain), members: S.map((r) => fromMember(r, movs[r.id])), pack: I.map(fromPack),
+    orders: P.map(fromOrder), tasks: T.map((r) => fromTask(r, emps)), log: L.map((r) => fromLog(r, kinds)),
+  };
+};
 const RT_TABLES = ["geneticas", "socios", "socio_movimientos", "inventario", "pedidos", "tareas", "audit_log"];
 
 /* ───────── Tokens ───────── */
@@ -842,14 +842,6 @@ function LoginScreen({ emps, onSubmit }) {
   const secs = Math.max(1, Math.ceil((until - now) / 1000));
   const submit = async (v) => {
     if (sel == null || locked || busy || v.length !== 4) return;
-    
-    // BYPASS LOCAL: Si ponés 0000, entra directo
-    if (v === "0000") {
-      setBusy(true);
-      await onSubmit(sel, "0000");
-      setBusy(false);
-      return;
-    }
 
     setBusy(true);
     const r = await onSubmit(sel, v);
@@ -1778,16 +1770,16 @@ function Sidebar({ me, tab, setTab, onSession, onLogout, badges }) {
 }
 
 export default function App({ initialTab = "gen" }) {
-  const [boot, setBoot] = useState("ready");
+  const [boot, setBoot] = useState("loading");
   const [bootErr, setBootErr] = useState("");
-  const [loginList, setLoginList] = useState([{ id: 1, name: LOCAL_EMP.name, kind: LOCAL_EMP.kind }]);
-  const [session, setSession] = useState({ ...LOCAL_SESSION, day: dayKey() });
+  const [loginList, setLoginList] = useState([]);
+  const [session, setSession] = useState(null); // { id: <uuid de empleados.id>, token, exp, day } — se completa al iniciar turno o al restaurar la sesión guardada
   const [tab, setTab] = useState(initialTab);
   const [strains, setStrains] = useState([]);
   const [members, setMembers] = useState([]);
   const [pack, setPack] = useState([]);
   const [orders, setOrders] = useState([]);
-  const [emps, setEmps] = useState([LOCAL_EMP]);
+  const [emps, setEmps] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [log, setLog] = useState([]);
   const [eqMode, setEqMode] = useState("emp");
@@ -1807,16 +1799,23 @@ export default function App({ initialTab = "gen" }) {
   const restricted = () => setConfirm({ k: "restricted" });
 
   const toLogin = async (msg) => {
-    // MODO LOCAL: "cambiar turno" vuelve a la pantalla de login sin consultar nada (PIN: cualquiera)
-    save("session", null); setSession(null);
-    resetUi(); setBoot("login");
-    if (msg) flash(msg, 3500);
+    TOKEN = null; save("session", null); setSession(null);
+    setStrains([]); setMembers([]); setPack([]); setOrders([]); setEmps([]); setTasks([]); setLog([]);
+    resetUi(); setBoot("loading");
+    try {
+      const list = await ok(supabase.rpc("listar_empleados_login"));
+      setLoginList(list.map((e) => ({ id: e.id, name: e.nombre, kind: e.avatar_svg })));
+      setBoot("login");
+      if (msg) flash(msg, 3500);
+    } catch (e) { setBootErr(e.message || "Sin conexión"); setBoot("error"); }
   };
   const expire = (msg) => toLogin(msg || "Tu sesión venció. Ingresá de nuevo.");
 
   const refresh = useCallback(async () => {
-    // MODO LOCAL: datos mock instantáneos, sin red ni loaders
-    const d = mockData();
+    if (!TOKEN) return null;
+    const my = ++seq.current;
+    const d = await loadAll();
+    if (my !== seq.current || !TOKEN) return d;
     setEmps(d.emps); setStrains(d.strains); setMembers(d.members); setPack(d.pack); setOrders(d.orders); setTasks(d.tasks); setLog(d.log);
     return d;
   }, []);
@@ -1842,52 +1841,44 @@ export default function App({ initialTab = "gen" }) {
       empleado_id: eid ?? (e && e.id) ?? null, empleado_nombre: u ?? (e && e.name) ?? null, categoria_badge: cat, descripcion: txt,
       cambio_gramos: d.g ?? null, cambio_dinero: d.m ?? null, cambio_unidades: d.u ?? null, unidad: unit ?? null,
       stock_antes: before ?? null, stock_despues: after ?? null, justificacion_merma: why ?? null,
-    }).then(({ error }) => { if (error) console.error("audit_log:", error.message); });
+    }).then(({ error }) => { if (error) console.error("[audit_log] no se pudo registrar:", error.code, error.message, error.details || "", error.hint || ""); });
   };
 
   
   const doLogin = async (id, pin) => {
-  // BYPASS LOCAL: Si ponés 0000, simulamos una sesión exitosa local
-  if (LOCAL || pin === "0000") {
-      const empleadoElegido = loginList.find((e) => e.id === id) || loginList[0] || { id: 1, name: "Admin", kind: "warrior" };
-      const fakeToken = LOCAL_TOKEN;
-      TOKEN = fakeToken;
-      
-      const s = { id: empleadoElegido.id, token: fakeToken, exp: Math.floor(Date.now() / 1000) + 86400, day: dayKey() };
-      save("session", s); 
-      setSession(s); 
-      resetUi(); 
-      setBoot("ready");
+    let r;
+    try {
+      const { data, error } = await supabase.functions.invoke("login-pin", { body: { empleado_id: id, pin } });
+      if (error || !data) { console.error("[login-pin]", error || "respuesta vacía"); return { ok: false, motivo: "red" }; }
+      r = data;
+    } catch (e) { console.error("[login-pin]", e); return { ok: false, motivo: "red" }; }
+    if (!r.ok) return r;
+    TOKEN = r.token; supabase.realtime.setAuth(r.token);
+    try { await refresh(); } catch (e) { console.error("[login] no se pudieron cargar los datos:", e); TOKEN = null; return { ok: false, motivo: "red" }; }
+    const s = { id: r.empleado_id, token: r.token, exp: r.exp, day: dayKey() }; // empleado_id = uuid real
+    save("session", s); setSession(s); resetUi(); setBoot("ready");
+    note("inició turno.", { eid: r.empleado_id, u: r.nombre }).then(bg);
+    flash(`Hola ${r.nombre}`);
+    return r;
+  };
 
-      // Carga inicial silenciada para dev local
-      refresh().catch(() => {});
-
-      flash(`Hola ${empleadoElegido.name} (Modo Local)`);
-      return { ok: true, empleado_id: empleadoElegido.id, nombre: empleadoElegido.name, token: fakeToken };
-    }
-
-  let r;
-  try {
-    const { data, error } = await supabase.functions.invoke("login-pin", { body: { empleado_id: id, pin } });
-    if (error || !data) return { ok: false, motivo: "red" };
-    r = data;
-  } catch { return { ok: false, motivo: "red" }; }
-  if (!r.ok) return r;
-  TOKEN = r.token; supabase.realtime.setAuth(r.token);
-  try { await refresh(); } catch { TOKEN = null; return { ok: false, motivo: "red" }; }
-  const s = { id: r.empleado_id, token: r.token, exp: r.exp, day: dayKey() };
-  save("session", s); setSession(s); resetUi(); setBoot("ready");
-  note("inició turno.", { eid: r.empleado_id, u: r.nombre }).then(bg);
-  flash(`Hola ${r.nombre}`);
-  return r;
-};
-  /* Arranque local: sin async ni red. Todo ya está en "ready" con la sesión falsa; solo rellena el mock. */
-  useEffect(() => { TOKEN = LOCAL_TOKEN; setBoot("ready"); refresh(); }, []);
+  /* Arranque: restaura el turno guardado (mismo día, JWT vigente) cargando las tablas reales; si no hay, va al login */
+  useEffect(() => {
+    (async () => {
+      const s = load("session", null);
+      if (s && s.token && s.id && s.day === dayKey() && s.exp * 1000 > Date.now()) {
+        TOKEN = s.token; supabase.realtime.setAuth(s.token);
+        try { await refresh(); setSession(s); setBoot("ready"); return; }
+        catch (e) { console.error("[arranque] sesión guardada inválida:", e); TOKEN = null; if (!isAuthErr(e)) { setBootErr(e.message || "Sin conexión"); setBoot("error"); return; } }
+      }
+      await toLogin();
+    })();
+  }, []);
 
   const doLogout = async () => { await note("cerró turno."); await toLogin(); };
 
   useEffect(() => {
-    if (LOCAL || boot !== "ready") return; // MODO LOCAL: sin Realtime
+    if (boot !== "ready") return;
     let t;
     const ch = supabase.channel("club");
     RT_TABLES.forEach((tb) => ch.on("postgres_changes", { event: "*", schema: "public", table: tb }, () => { clearTimeout(t); t = setTimeout(bg, 400); }));
@@ -1911,7 +1902,7 @@ export default function App({ initialTab = "gen" }) {
     (async () => {
       const gone = await ok(supabase.from("pedidos").delete().in("id", stale.map((o) => o.id)).eq("estado", "cancelado").select("id"));
       if (gone.length) { await note(`limpió ${gone.length} pedido${gone.length > 1 ? "s" : ""} cancelado${gone.length > 1 ? "s" : ""} con más de 2 días (${gone.map((o) => "#" + o.id).join(", ")}).`, { cat: "baja", u: "Sistema" }); await refresh(); }
-    })().catch(() => {});
+    })().catch((e) => console.error("[limpieza de cancelados]", e));
   }, [orders, tick, me && me.id]);
 
   const reservedOf = (sid) => r2(orders.filter(isActive).reduce((a, o) => a + gOf(o.items, sid), 0));
@@ -1954,7 +1945,7 @@ export default function App({ initialTab = "gen" }) {
   });
 
   const saveAddr = act(async (mid, addr) => {
-    await ok(supabase.from("socios").update({ direccion_calle: addr.street, direccion_zona: addr.zone, direccion_partido: addr.partido, direccion_notas: addr.notes }).eq("id", mid));
+    await upd("socios", mid, { direccion_calle: addr.street, direccion_zona: addr.zone, direccion_partido: addr.partido, direccion_notas: addr.notes });
     await note(`actualizó la dirección principal del socio ${mname(mid)}: ${destText(addr)}.`, { cat: "socio" });
     await sync("Dirección guardada");
   });
@@ -1977,7 +1968,7 @@ export default function App({ initialTab = "gen" }) {
   const addItem = act(async (oid, { sid, g }) => {
     const o = orders.find((x) => x.id === oid);
     const items = o.items.some((i) => i.s === sid) ? o.items.map((i) => (i.s === sid ? { ...i, g: r2(i.g + g) } : i)) : [...o.items, { s: sid, g }];
-    await ok(supabase.from("pedidos").update({ items_json: toItems(items), total: totalOf(items) }).eq("id", oid));
+    await upd("pedidos", oid, { items_json: toItems(items), total: totalOf(items) });
     await note(`sumó ${gx(g)}g de ${strainOf(sid).name} al pedido #${oid}.`, { cat: "out" });
     await finish("Producto agregado");
   });
@@ -2007,7 +1998,7 @@ export default function App({ initialTab = "gen" }) {
 
   const toggleTask = act(async (i) => {
     const t = tasks[i];
-    await ok(supabase.from("tareas").update({ completada: !t.d }).eq("id", t.id));
+    await upd("tareas", t.id, { completada: !t.d });
     await note(`${t.d ? "reabrió" : "completó"} la tarea: ${t.t}.`);
     await refresh();
   });
@@ -2027,7 +2018,7 @@ export default function App({ initialTab = "gen" }) {
   });
   const doEditPack = act(async (id, v) => {
     const old = packOf(id);
-    await ok(supabase.from("inventario").update({ nombre_insumo: v.name, unidad: v.unit, cantidad_minima: v.min }).eq("id", id));
+    await upd("inventario", id, { nombre_insumo: v.name, unidad: v.unit, cantidad_minima: v.min });
     await note(`editó el insumo ${old.name}${v.name !== old.name ? ` (ahora ${v.name})` : ""}: mínimo ${fg(v.min)} ${v.unit}.`);
     await finish("Insumo actualizado");
   });
