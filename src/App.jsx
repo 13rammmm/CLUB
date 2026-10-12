@@ -5,7 +5,7 @@ import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus,
 /* ═════ MODO LOCAL / MOCK ═════
    Supabase queda reemplazado por un stub no-op: ninguna llamada sale a la red (cero 401 en consola).
    Para volver a la base real: descomentá el import de arriba y el bloque ORIGINAL de abajo, y borrá el stub. */
-const LOCAL = true;
+const LOCAL = false;
 const LOCAL_TOKEN = "token-local-dev-ok";
 const LOCAL_EMP = { id: 1, name: "Admin (Local)", role: "Administrador", kind: "warrior", admin: true };
 const LOCAL_SESSION = { id: 1, name: "Admin (Local)", token: LOCAL_TOKEN, exp: Math.floor(Date.now() / 1000) + 86400 * 365, day: null };
