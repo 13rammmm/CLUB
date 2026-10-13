@@ -1,4 +1,4 @@
-import { useState, useId, useEffect, useRef, useCallback } from "react";
+import { useState, useId, useEffect, useRef, useCallback, Component } from "react";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2, Archive, ArchiveRestore, ChevronLeft } from "lucide-react";
 
@@ -89,7 +89,7 @@ const fromPack = (r) => ({ id: r.id, name: r.nombre_insumo, unit: r.unidad, qty:
 const fromOrder = (r) => {
   const a = r.direccion_entrega || {};
   return {
-    id: r.id, m: r.socio_id ?? 0, items: (r.items_json || []).map((i) => ({ s: i.genetica_id, g: num(i.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega, ts: parseTs(r.created_at ?? r.creado_en), total: num(r.total), arch: !!r.archivado,
+    id: r.id, m: r.socio_id ?? 0, items: (Array.isArray(r.items_json) ? r.items_json : []).map((i) => ({ s: i?.genetica_id, g: num(i?.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega, ts: parseTs(r.created_at ?? r.creado_en), total: num(r.total), arch: !!r.archivado,
     c: r.estado === "cancelado", cAt: r.cancelado_en ? Date.parse(r.cancelado_en) : undefined, addr: a.street ? a : undefined, alt: r.es_alternativa,
   };
 };
@@ -1661,7 +1661,7 @@ function InvView({ pack, strains, reservedOf, freeOf, openSheet, onDelete }) {
 function PedidosSummary({ orders, members }) {
   const act = orders.filter(isActive);
   const rows = [...ST.map((l, i) => [l, orders.filter((o) => !o.c && o.st === i).length]), ["Cancelado", orders.filter((o) => o.c).length]];
-  const reserved = r2(act.reduce((a, o) => a + o.items.reduce((t, it) => t + it.g, 0), 0));
+  const reserved = r2(act.reduce((a, o) => a + (o.items || []).reduce((t, it) => t + it.g, 0), 0));
   const next = [...act].sort((a, b) => String(a.h).localeCompare(String(b.h))).slice(0, 5);
   const who = (id) => { const m = members.find((x) => x.id === id); return m ? `${m.first}${m.last ? ` ${m.last[0]}.` : ""}` : "Socio eliminado"; };
   return (
@@ -1686,6 +1686,23 @@ function PedidosSummary({ orders, members }) {
   );
 }
 
+/* Si una pantalla lanza un error de render, muestra un aviso con el detalle (y lo loguea) en vez de dejar la app en negro */
+class TabBoundary extends Component {
+  state = { err: null };
+  static getDerivedStateFromError(err) { return { err }; }
+  componentDidCatch(err, info) { console.error("[pantalla]", err, info && info.componentStack); }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <Card>
+        <h3 className="text-xl font-black tracking-tight">Esta pantalla tuvo un error</h3>
+        <p className="mt-2 text-sm font-bold text-zinc-600">{String((this.state.err && this.state.err.message) || this.state.err)}</p>
+        <div className="mt-3 flex"><Pill onClick={() => this.setState({ err: null })}>Reintentar</Pill></div>
+      </Card>
+    );
+  }
+}
+
 /* ───────── Finanzas ─────────
    Consolida ingresos (pedidos entregados, salidas rápidas cobradas, cobros de cuenta), gastos de insumos, mermas y cuentas corrientes.
    Los pedidos salen del estado; el resto se consulta en Supabase solo para el período elegido (sin límite de 500 filas del historial). */
@@ -1695,7 +1712,8 @@ const ymd = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())
 const fromYmd = (v) => { const [y, m, d] = v.split("-").map(Number); return new Date(y, m - 1, d); };
 const sgn = (v) => `${v < 0 ? "−" : ""}$${money(v)}`;
 
-function FinanzasView({ orders, members, strains, log }) {
+function FinanzasView({ orders: ordersIn, members: membersIn, strains: strainsIn, log: logIn }) {
+  const orders = ordersIn || [], members = membersIn || [], strains = strainsIn || [], log = logIn || [];
   const today = new Date(), cur = monthIdx(today.getTime()), todayS = ymd(today);
   const [mode, setMode] = useState("m"), [month, setMonth] = useState(cur), [day, setDay] = useState(todayS);
   const [from, setFrom] = useState(ymd(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6))), [to, setTo] = useState(todayS);
@@ -1707,7 +1725,7 @@ function FinanzasView({ orders, members, strains, log }) {
   if (mode === "d") { t0 = dStart(day); t1 = new Date(t0.getFullYear(), t0.getMonth(), t0.getDate() + 1); }
   else if (mode === "r") { let x = dStart(from), y = dStart(to); if (y < x) [x, y] = [y, x]; t0 = x; t1 = new Date(y.getFullYear(), y.getMonth(), y.getDate() + 1); }
   else { t0 = new Date(Math.floor(month / 12), month % 12, 1); t1 = new Date(Math.floor(month / 12), (month % 12) + 1, 1); }
-  const a0 = t0.getTime(), a1 = t1.getTime(), stamp = log.length ? log[0].id : 0;
+  const a0 = t0.getTime(), a1 = t1.getTime(), stamp = log[0]?.id ?? 0;
 
   useEffect(() => {
     let off = false;
@@ -1720,30 +1738,30 @@ function FinanzasView({ orders, members, strains, log }) {
         ok(au().eq("categoria_badge", "out").ilike("descripcion", "%Salida R%")),
         ok(supabase.from("socio_movimientos").select("*").gte("creado_en", i0).lt("creado_en", i1).order("creado_en", { ascending: false }).limit(1000)),
       ]);
-      if (!off) setDb({ audit: [...A, ...S], movs: M, err: null, loading: false });
+      if (!off) setDb({ audit: [...(A || []), ...(S || [])], movs: M || [], err: null, loading: false });
     })().catch((e) => { console.error("[finanzas] no se pudo leer el período:", e); if (!off) setDb({ audit: [], movs: [], err: (e && e.message) || "Error de red", loading: false }); });
     return () => { off = true; };
   }, [a0, a1, stamp, retry]);
 
   const who = (id) => { const m = members.find((x) => x.id === id); return m ? `${m.first}${m.last ? ` ${m.last[0]}.` : ""}` : "Socio eliminado"; };
   const stName = (id) => (strains.find((x) => x.id === id) || { name: "Genética eliminada" }).name;
-  const val = (o) => o.total || r2(o.items.reduce((t, it) => t + it.g * ((strains.find((x) => x.id === it.s) || {}).p || 0), 0));
+  const val = (o) => o?.total || r2((o.items || []).reduce((t, it) => t + it.g * ((strains.find((x) => x.id === it.s) || {}).p || 0), 0));
   const cap = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : "");
 
   const items = [];
   orders.filter((o) => !o.c && o.st === 3 && o.ts && o.ts >= a0 && o.ts < a1).forEach((o) => items.push({
-    k: "o" + o.id, cat: "ing", ts: o.ts, t: `Pedido #${o.id} · ${who(o.m)}`, s: o.items.map((it) => `${stName(it.s)} ${fg(it.g)}g`).join(", "), amt: val(o), g: r2(o.items.reduce((t, it) => t + it.g, 0)),
+    k: "o" + o.id, cat: "ing", ts: o.ts, t: `Pedido #${o.id} · ${who(o.m)}`, s: (o.items || []).map((it) => `${stName(it.s)} ${fg(it.g)}g`).join(", "), amt: val(o), g: r2((o.items || []).reduce((t, it) => t + it.g, 0)),
   }));
-  db.audit.forEach((r) => {
+  (db.audit || []).forEach((r) => {
     const m = r.cambio_dinero == null ? null : num(r.cambio_dinero), g = r.cambio_gramos == null ? null : num(r.cambio_gramos);
     const b = { k: "a" + r.id, ts: Date.parse(r.timestamp), t: cap(r.descripcion), s: r.empleado_nombre ? `por ${r.empleado_nombre}` : "" };
     if (r.categoria_badge === "gasto") items.push({ ...b, cat: "gas", amt: Math.abs(m || 0) });
     else if (r.categoria_badge === "merma" || (r.categoria_badge === "baja" && g != null && g < 0)) items.push({ ...b, cat: "mer", g: Math.abs(g || 0), s: [r.justificacion_merma && `Motivo: ${r.justificacion_merma}`, b.s].filter(Boolean).join(" · ") });
     else if (r.categoria_badge === "out") items.push({ ...b, cat: "sal", g: Math.abs(g || 0), amt: m > 0 ? m : 0 });
   });
-  db.movs.forEach((r) => { const amt = num(r.monto); if (amt) items.push({ k: "m" + r.id, cat: "fia", ts: Date.parse(r.creado_en), t: `${who(r.socio_id)} · ${r.descripcion}`, s: amt > 0 ? "Pago / saldo a favor" : "Fiado", amt }); });
+  (db.movs || []).forEach((r) => { const amt = num(r.monto); if (amt) items.push({ k: "m" + r.id, cat: "fia", ts: Date.parse(r.creado_en), t: `${who(r.socio_id)} · ${r.descripcion}`, s: amt > 0 ? "Pago / saldo a favor" : "Fiado", amt }); });
 
-  const sum = (c, f) => r2(items.filter((x) => x.cat === c).reduce((t, x) => t + f(x), 0));
+  const sum = (c, f) => r2(items.filter((x) => x.cat === c).reduce((t, x) => t + (Number(f(x)) || 0), 0));
   const inPed = sum("ing", (x) => x.amt), inSal = sum("sal", (x) => x.amt), inCta = r2(items.filter((x) => x.cat === "fia" && x.amt > 0).reduce((t, x) => t + x.amt, 0));
   const ingresado = r2(inPed + inSal + inCta), gastado = sum("gas", (x) => x.amt), balance = r2(ingresado - gastado);
   const gramos = r2(sum("ing", (x) => x.g) + sum("sal", (x) => x.g)), merma = sum("mer", (x) => x.g);
@@ -1842,9 +1860,9 @@ function FinanzasView({ orders, members, strains, log }) {
   );
 }
 
-function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel, onArchive }) {
+function PedidosView({ orders = [], members = [], strains = [], openSheet, onAdvance, onCancel, onArchive }) {
   const [f, setF] = useState("all");
-  const shown = orders.filter((o) => !o.arch), arch = orders.filter((o) => o.arch);
+  const shown = (orders || []).filter((o) => !o.arch), arch = (orders || []).filter((o) => o.arch);
   const base = f === "a" ? arch : shown;
   const list = base.filter((o) => (f === "all" || f === "a" ? true : f === "x" ? o.c : !o.c && String(o.st) === f));
   const opts = [["all", "Todos"], ["0", "Pendiente"], ["1", "Listo"], ["2", "En camino"], ["3", "Entregado"], ["x", "Cancelado"], ...(arch.length || f === "a" ? [["a", `Archivados (${arch.length})`]] : [])];
@@ -1870,7 +1888,7 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
               </div>
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
-              {o.items.map((i) => <Tag key={i.s}>{(strains.find((s) => s.id === i.s) || { name: "Genética eliminada" }).name} {fg(i.g)}g</Tag>)}
+              {(o.items || []).map((i) => <Tag key={i.s}>{(strains.find((s) => s.id === i.s) || { name: "Genética eliminada" }).name} {fg(i.g)}g</Tag>)}
             </div>
             <div className={o.c ? "opacity-50" : ""}><DestBox a={o.addr || m.addr} alt={o.alt} /></div>
             <div className="mt-3 flex items-center gap-1.5 text-sm font-bold">
@@ -2357,14 +2375,16 @@ export default function App({ initialTab = "gen" }) {
     eq: ["Equipo", `Sesión: ${me.name} • ${me.admin ? "Administrador" : me.role}`],
     inv: ["Inventario", lowPack ? `${lowPack} material${lowPack > 1 ? "es" : ""} en mínimo` : "Todo en orden"],
     ped: ["Pedidos", `${activeOrders} pedidos activos hoy`],
-  }[tab];
+    fin: ["Finanzas", "Ingresos, gastos, mermas y cuentas"],
+  }[tab] || [tab, ""]; // nunca undefined: una pestaña sin encabezado ya no rompe la pantalla
   const ADD = {
     gen: [{ k: "addStrain" }, "Agregar genética"],
     soc: [{ k: "addMember" }, "Agregar socio"],
     eq: eqMode === "emp" ? [{ k: "addStaff" }, "Agregar empleado"] : eqMode === "tar" ? [{ k: "addTask" }, "Agregar tarea"] : null,
     inv: [{ k: "addPack" }, "Agregar material"],
     ped: [{ k: "new" }, "Nuevo pedido"],
-  }[tab];
+    fin: null,
+  }[tab] || null;
 
   const sm = sheet && sheet.k === "member" ? members.find((m) => m.id === sheet.id) : null;
   const sp = sheet && ["packUse", "packRestock", "packEdit"].includes(sheet.k) ? pack.find((x) => x.id === sheet.id) : null;
@@ -2395,8 +2415,8 @@ export default function App({ initialTab = "gen" }) {
         {tab === "soc" && <SociosView members={members} openSheet={setSheet} />}
         {tab === "eq" && <EquipoView emps={emps} tasks={tasks} user={user} isAdmin={isAdmin} onLogout={doLogout} log={log} mode={eqMode} setMode={setEqMode} openSheet={setSheet} onTask={toggleTask} onDeleteEmp={(i) => (isAdmin ? setConfirm({ k: "emp", i }) : restricted())} onDeleteTask={askDelTask} />}
         {tab === "inv" && <InvView pack={pack} strains={strains} reservedOf={reservedOf} freeOf={packFree} openSheet={setSheet} onDelete={(id) => setConfirm({ k: "pack", id })} />}
-        {tab === "ped" && <PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onArchive={archive} />}
-        {tab === "fin" && <FinanzasView orders={orders} members={members} strains={strains} log={log} />}
+        {tab === "ped" && <TabBoundary><PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onArchive={archive} /></TabBoundary>}
+        {tab === "fin" && <TabBoundary><FinanzasView orders={orders} members={members} strains={strains} log={log} /></TabBoundary>}
       </div>
       </div>
 
