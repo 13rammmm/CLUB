@@ -1,6 +1,6 @@
 import { useState, useId, useEffect, useRef, useCallback } from "react";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2, Eye, ChevronLeft } from "lucide-react";
+import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2, Archive, ArchiveRestore, ChevronLeft } from "lucide-react";
 
 /* ═════════════ SUPABASE ═════════════
    La clave "publishable" es pública por diseño: la seguridad real la dan las políticas RLS.
@@ -89,7 +89,7 @@ const fromPack = (r) => ({ id: r.id, name: r.nombre_insumo, unit: r.unidad, qty:
 const fromOrder = (r) => {
   const a = r.direccion_entrega || {};
   return {
-    id: r.id, m: r.socio_id ?? 0, items: (r.items_json || []).map((i) => ({ s: i.genetica_id, g: num(i.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega, ts: parseTs(r.created_at ?? r.creado_en), total: num(r.total),
+    id: r.id, m: r.socio_id ?? 0, items: (r.items_json || []).map((i) => ({ s: i.genetica_id, g: num(i.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega, ts: parseTs(r.created_at ?? r.creado_en), total: num(r.total), arch: !!r.archivado,
     c: r.estado === "cancelado", cAt: r.cancelado_en ? Date.parse(r.cancelado_en) : undefined, addr: a.street ? a : undefined, alt: r.es_alternativa,
   };
 };
@@ -1686,96 +1686,174 @@ function PedidosSummary({ orders, members }) {
   );
 }
 
-/* Historial financiero por mes/día. Lee TODOS los pedidos (también los ocultos): ocultar no afecta ningún total. */
-function FinView({ orders, members, strains }) {
-  const cur = monthIdx(Date.now());
-  const dated = orders.filter((o) => o.ts);
-  const movs = members.flatMap((m) => (m.mov || []).filter((x) => x.ts));
-  const keys = [...new Set([cur, ...dated.map((o) => monthIdx(o.ts)), ...movs.map((x) => monthIdx(x.ts))])].sort((a, b) => b - a);
-  const [k, setK] = useState(cur), [day, setDay] = useState(""), [n, setN] = useState(10);
-  const go = (nk) => { setK(nk); setDay(""); setN(10); };
-  const i = keys.indexOf(k), older = keys[i + 1], newer = keys[i - 1];
-  const dOf = (ts) => new Date(ts).getDate();
-  const pickDay = (x) => !day || dOf(x.ts) === Number(day);
-  const ordM = dated.filter((o) => monthIdx(o.ts) === k), movM = movs.filter((x) => monthIdx(x.ts) === k);
-  const days = [...new Set([...ordM.map((o) => dOf(o.ts)), ...movM.map((x) => dOf(x.ts))])].sort((a, b) => b - a);
-  const ord = ordM.filter(pickDay).sort((a, b) => b.ts - a.ts), mv = movM.filter(pickDay);
-  const val = (o) => o.total || r2(o.items.reduce((t, it) => t + it.g * ((strains.find((s) => s.id === it.s) || {}).p || 0), 0));
-  const done = ord.filter((o) => !o.c && o.st === 3);
-  const fact = r2(done.reduce((a, o) => a + val(o), 0));
-  const grams = r2(done.reduce((a, o) => a + o.items.reduce((t, it) => t + it.g, 0), 0));
-  const fiado = r2(mv.filter((x) => x.amt < 0).reduce((a, x) => a - x.amt, 0));
-  const cobrado = r2(mv.filter((x) => x.amt > 0).reduce((a, x) => a + x.amt, 0));
-  const noDate = orders.length - dated.length;
+/* ───────── Finanzas ─────────
+   Consolida ingresos (pedidos entregados, salidas rápidas cobradas, cobros de cuenta), gastos de insumos, mermas y cuentas corrientes.
+   Los pedidos salen del estado; el resto se consulta en Supabase solo para el período elegido (sin límite de 500 filas del historial). */
+const FIN_CATS = { ing: { l: "Ingreso por pedido", bg: "#16A34A" }, sal: { l: "Salida rápida", bg: "#2563EB" }, gas: { l: "Gasto de insumos", bg: "#A16207" }, mer: { l: "Merma / pérdida", bg: "#EA580C" }, fia: { l: "Cuenta corriente", bg: "#7C3AED" } };
+const FIN_FILTERS = [["all", "Todo"], ["ing", "Ingresos"], ["gas", "Gastos"], ["mer", "Mermas"], ["sal", "Salidas rápidas"], ["fia", "Fiados"]];
+const ymd = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+const fromYmd = (v) => { const [y, m, d] = v.split("-").map(Number); return new Date(y, m - 1, d); };
+const sgn = (v) => `${v < 0 ? "−" : ""}$${money(v)}`;
+
+function FinanzasView({ orders, members, strains, log }) {
+  const today = new Date(), cur = monthIdx(today.getTime()), todayS = ymd(today);
+  const [mode, setMode] = useState("m"), [month, setMonth] = useState(cur), [day, setDay] = useState(todayS);
+  const [from, setFrom] = useState(ymd(new Date(today.getFullYear(), today.getMonth(), today.getDate() - 6))), [to, setTo] = useState(todayS);
+  const [cat, setCat] = useState("all"), [n, setN] = useState(20), [retry, setRetry] = useState(0);
+  const [db, setDb] = useState({ audit: [], movs: [], err: null, loading: true });
+
+  const dStart = (v) => fromYmd(v || todayS);
+  let t0, t1;
+  if (mode === "d") { t0 = dStart(day); t1 = new Date(t0.getFullYear(), t0.getMonth(), t0.getDate() + 1); }
+  else if (mode === "r") { let x = dStart(from), y = dStart(to); if (y < x) [x, y] = [y, x]; t0 = x; t1 = new Date(y.getFullYear(), y.getMonth(), y.getDate() + 1); }
+  else { t0 = new Date(Math.floor(month / 12), month % 12, 1); t1 = new Date(Math.floor(month / 12), (month % 12) + 1, 1); }
+  const a0 = t0.getTime(), a1 = t1.getTime(), stamp = log.length ? log[0].id : 0;
+
+  useEffect(() => {
+    let off = false;
+    setDb((d) => ({ ...d, loading: true, err: null }));
+    (async () => {
+      const i0 = new Date(a0).toISOString(), i1 = new Date(a1).toISOString();
+      const au = () => supabase.from("audit_log").select("*").gte("timestamp", i0).lt("timestamp", i1).order("timestamp", { ascending: false }).limit(1000);
+      const [A, S, M] = await Promise.all([
+        ok(au().in("categoria_badge", ["gasto", "merma", "baja"])),
+        ok(au().eq("categoria_badge", "out").ilike("descripcion", "%Salida R%")),
+        ok(supabase.from("socio_movimientos").select("*").gte("creado_en", i0).lt("creado_en", i1).order("creado_en", { ascending: false }).limit(1000)),
+      ]);
+      if (!off) setDb({ audit: [...A, ...S], movs: M, err: null, loading: false });
+    })().catch((e) => { console.error("[finanzas] no se pudo leer el período:", e); if (!off) setDb({ audit: [], movs: [], err: (e && e.message) || "Error de red", loading: false }); });
+    return () => { off = true; };
+  }, [a0, a1, stamp, retry]);
+
+  const who = (id) => { const m = members.find((x) => x.id === id); return m ? `${m.first}${m.last ? ` ${m.last[0]}.` : ""}` : "Socio eliminado"; };
+  const stName = (id) => (strains.find((x) => x.id === id) || { name: "Genética eliminada" }).name;
+  const val = (o) => o.total || r2(o.items.reduce((t, it) => t + it.g * ((strains.find((x) => x.id === it.s) || {}).p || 0), 0));
+  const cap = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : "");
+
+  const items = [];
+  orders.filter((o) => !o.c && o.st === 3 && o.ts && o.ts >= a0 && o.ts < a1).forEach((o) => items.push({
+    k: "o" + o.id, cat: "ing", ts: o.ts, t: `Pedido #${o.id} · ${who(o.m)}`, s: o.items.map((it) => `${stName(it.s)} ${fg(it.g)}g`).join(", "), amt: val(o), g: r2(o.items.reduce((t, it) => t + it.g, 0)),
+  }));
+  db.audit.forEach((r) => {
+    const m = r.cambio_dinero == null ? null : num(r.cambio_dinero), g = r.cambio_gramos == null ? null : num(r.cambio_gramos);
+    const b = { k: "a" + r.id, ts: Date.parse(r.timestamp), t: cap(r.descripcion), s: r.empleado_nombre ? `por ${r.empleado_nombre}` : "" };
+    if (r.categoria_badge === "gasto") items.push({ ...b, cat: "gas", amt: Math.abs(m || 0) });
+    else if (r.categoria_badge === "merma" || (r.categoria_badge === "baja" && g != null && g < 0)) items.push({ ...b, cat: "mer", g: Math.abs(g || 0), s: [r.justificacion_merma && `Motivo: ${r.justificacion_merma}`, b.s].filter(Boolean).join(" · ") });
+    else if (r.categoria_badge === "out") items.push({ ...b, cat: "sal", g: Math.abs(g || 0), amt: m > 0 ? m : 0 });
+  });
+  db.movs.forEach((r) => { const amt = num(r.monto); if (amt) items.push({ k: "m" + r.id, cat: "fia", ts: Date.parse(r.creado_en), t: `${who(r.socio_id)} · ${r.descripcion}`, s: amt > 0 ? "Pago / saldo a favor" : "Fiado", amt }); });
+
+  const sum = (c, f) => r2(items.filter((x) => x.cat === c).reduce((t, x) => t + f(x), 0));
+  const inPed = sum("ing", (x) => x.amt), inSal = sum("sal", (x) => x.amt), inCta = r2(items.filter((x) => x.cat === "fia" && x.amt > 0).reduce((t, x) => t + x.amt, 0));
+  const ingresado = r2(inPed + inSal + inCta), gastado = sum("gas", (x) => x.amt), balance = r2(ingresado - gastado);
+  const gramos = r2(sum("ing", (x) => x.g) + sum("sal", (x) => x.g)), merma = sum("mer", (x) => x.g);
+  const fiadoNuevo = r2(items.filter((x) => x.cat === "fia" && x.amt < 0).reduce((t, x) => t - x.amt, 0));
+  const debt = r2(members.filter((m) => m.balance < 0).reduce((t, m) => t - m.balance, 0)), favor = r2(members.filter((m) => m.balance > 0).reduce((t, m) => t + m.balance, 0));
+  const rows = items.filter((x) => cat === "all" || x.cat === cat).sort((x, y) => y.ts - x.ts);
+
   const sel = { border: `3px solid ${INK}`, background: "#fff", color: INK };
-  const navBtn = (dis) => ({ ...line(3), background: "#fff", opacity: dis ? 0.3 : 1 });
+  const step = (dir) => { if (mode === "m") setMonth(month + dir); else { const d = dStart(day); d.setDate(d.getDate() + dir); setDay(ymd(d)); } setN(20); };
+  const nb = (dir, dis) => (
+    <button aria-label={dir < 0 ? "Anterior" : "Siguiente"} disabled={dis} onClick={() => step(dir)} className="flex h-11 w-11 flex-none items-center justify-center rounded-full" style={{ ...line(3), background: "#fff", opacity: dis ? 0.3 : 1 }}>
+      {dir < 0 ? <ChevronLeft size={22} strokeWidth={3} /> : <ChevronRight size={22} strokeWidth={3} />}
+    </button>
+  );
   const stat = (label, v) => (
     <div className="rounded-2xl p-3" style={line(2)}>
       <div className="text-xs font-black uppercase tracking-wide text-zinc-600">{label}</div>
       <div className="mt-0.5 text-xl font-black leading-tight">{v}</div>
     </div>
   );
+  const amtTxt = (x) => x.cat === "gas" ? `−$${money(x.amt)}` : x.cat === "mer" ? `−${fg(x.g)}g` : x.cat === "sal" ? (x.amt > 0 ? `+$${money(x.amt)} · ${fg(x.g)}g` : `${fg(x.g)}g · a cuenta`) : x.cat === "fia" ? sgn(x.amt).replace(/^(?!−)/, "+") : `+$${money(x.amt)}`;
+  const monthOpts = [...new Set([...Array.from({ length: 36 }, (_, i) => cur - i), month])].sort((x, y) => y - x);
+  const dateIn = "h-11 min-w-0 flex-1 rounded-full px-3 text-sm font-black";
+
   return (
-    <Card>
-      <h3 className="text-2xl font-black tracking-tight">Finanzas</h3>
-      <div className="mt-3 flex items-center gap-2">
-        <button aria-label="Mes anterior" disabled={older == null} onClick={() => go(older)} className="flex h-11 w-11 flex-none items-center justify-center rounded-full" style={navBtn(older == null)}><ChevronLeft size={22} strokeWidth={3} /></button>
-        <select aria-label="Mes" value={k} onChange={(e) => go(Number(e.target.value))} className="h-11 min-w-0 flex-1 rounded-full px-3 text-sm font-black" style={sel}>
-          {keys.map((x) => <option key={x} value={x}>{monthLabel(x)}</option>)}
-        </select>
-        <button aria-label="Mes siguiente" disabled={newer == null} onClick={() => go(newer)} className="flex h-11 w-11 flex-none items-center justify-center rounded-full" style={navBtn(newer == null)}><ChevronRight size={22} strokeWidth={3} /></button>
-      </div>
-      <select aria-label="Día" value={day} onChange={(e) => { setDay(e.target.value); setN(10); }} className="mt-2 h-11 w-full rounded-full px-3 text-sm font-black" style={sel}>
-        <option value="">Todo el mes</option>
-        {days.map((d) => <option key={d} value={d}>{`${p2(d)}/${p2((k % 12) + 1)}/${Math.floor(k / 12)}`}</option>)}
-      </select>
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        {stat("Facturado", `$${money(fact)}`)}
-        {stat("Consumido", `${fg(grams)} g`)}
-        {stat("Fiado", `$${money(fiado)}`)}
-        {stat("Cobrado", `$${money(cobrado)}`)}
-      </div>
-      <p className="mt-2 text-xs font-bold text-zinc-600">Facturado y consumido: solo pedidos entregados. Fiado y cobrado: movimientos de cuenta de socios.</p>
-      <div className="mb-1 mt-4 text-sm font-black">Pedidos del período ({ord.length})</div>
-      {ord.length === 0 && <p className="text-sm font-bold text-zinc-500">Sin pedidos en este período.</p>}
-      {ord.slice(0, n).map((o, j) => {
-        const m = members.find((x) => x.id === o.m) || GONE_MEMBER;
-        return (
-          <div key={o.id} className={`py-2.5 ${o.c ? "opacity-50" : ""}`} style={j ? { borderTop: "2px solid #000" } : undefined}>
-            <div className="flex items-center justify-between gap-2 text-sm font-black">
-              <span className={`min-w-0 truncate ${o.c ? "line-through" : ""}`}>#{o.id} {m.first}{m.last ? ` ${m.last[0]}.` : ""}</span>
-              <span className="flex-none">${money(val(o))}</span>
-            </div>
-            <div className="mt-0.5 flex items-center justify-between gap-2 text-xs font-bold text-zinc-600">
-              <span>{fmtDT(o.ts)} • {fg(o.items.reduce((t, it) => t + it.g, 0))}g</span>
-              <span className="flex-none">{o.c ? "Cancelado" : ST[o.st]}</span>
-            </div>
+    <div className="flex min-w-0 flex-col gap-4 lg:max-w-3xl">
+      <Card>
+        <h3 className="text-2xl font-black tracking-tight">Finanzas</h3>
+        <div className="mt-3"><Seg opts={[["d", "Día"], ["m", "Mes"], ["r", "Rango"]]} value={mode} onChange={(v) => { setMode(v); setN(20); }} /></div>
+        {mode === "m" && (
+          <div className="mt-2 flex items-center gap-2">{nb(-1, false)}
+            <select aria-label="Mes" value={month} onChange={(e) => { setMonth(Number(e.target.value)); setN(20); }} className={dateIn} style={sel}>{monthOpts.map((k) => <option key={k} value={k}>{monthLabel(k)}</option>)}</select>
+            {nb(1, month >= cur)}</div>
+        )}
+        {mode === "d" && (
+          <div className="mt-2 flex items-center gap-2">{nb(-1, false)}
+            <input type="date" aria-label="Día" value={day} max={todayS} onChange={(e) => { if (e.target.value) { setDay(e.target.value); setN(20); } }} className={dateIn} style={sel} />
+            {nb(1, day >= todayS)}</div>
+        )}
+        {mode === "r" && (
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <label className="text-xs font-black">Desde<input type="date" value={from} max={todayS} onChange={(e) => { if (e.target.value) { setFrom(e.target.value); setN(20); } }} className={`${dateIn} mt-1 w-full`} style={sel} /></label>
+            <label className="text-xs font-black">Hasta<input type="date" value={to} max={todayS} onChange={(e) => { if (e.target.value) { setTo(e.target.value); setN(20); } }} className={`${dateIn} mt-1 w-full`} style={sel} /></label>
           </div>
-        );
-      })}
-      {ord.length > n && <div className="mt-2 flex"><Pill onClick={() => setN(n + 10)}>{`Ver más (${ord.length - n})`}</Pill></div>}
-      {noDate > 0 && <p className="mt-3 text-xs font-bold text-zinc-500">{noDate} {noDate === 1 ? "pedido sin fecha" : "pedidos sin fecha"} (created_at vacío): no entra en ningún mes.</p>}
-    </Card>
+        )}
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          {stat("Total ingresado", `$${money(ingresado)}`)}
+          {stat("Total gastado", `$${money(gastado)}`)}
+          {stat("Balance neto", sgn(balance))}
+          {stat("Gramos despachados", `${fg(gramos)} g`)}
+        </div>
+        <p className="mt-2 text-xs font-bold text-zinc-600">
+          Ingresos: pedidos entregados ${money(inPed)} · salidas rápidas cobradas ${money(inSal)} · cobros de cuenta ${money(inCta)}. Merma: {fg(merma)} g. Fiado nuevo: ${money(fiadoNuevo)}.
+        </p>
+        <p className="mt-1 text-xs font-bold text-zinc-600">Cuentas hoy: deuda de socios ${money(debt)} · saldo a favor ${money(favor)}.</p>
+      </Card>
+
+      <Seg dark opts={FIN_FILTERS} value={cat} onChange={(v) => { setCat(v); setN(20); }} />
+
+      {cat === "fia" && (
+        <Card>
+          <h3 className="text-xl font-black tracking-tight">Cuentas corrientes (estado actual)</h3>
+          {members.filter((m) => m.balance !== 0).length === 0 && <p className="mt-2 text-sm font-bold text-zinc-500">Ningún socio tiene deuda ni saldo a favor.</p>}
+          {[...members].filter((m) => m.balance !== 0).sort((x, y) => x.balance - y.balance).map((m, j) => (
+            <div key={m.id} className="flex items-center justify-between gap-2 py-2.5 text-sm font-black" style={j ? { borderTop: "2px solid #000" } : undefined}>
+              <span className="min-w-0 truncate">{m.first}{m.last ? ` ${m.last[0]}.` : ""}</span>
+              <Tag dark={m.balance < 0}>{m.balance < 0 ? `Debe $${money(m.balance)}` : `A favor $${money(m.balance)}`}</Tag>
+            </div>
+          ))}
+        </Card>
+      )}
+
+      <Card>
+        <h3 className="text-xl font-black tracking-tight">Movimientos ({rows.length})</h3>
+        {db.loading && <p className="mt-2 text-sm font-bold text-zinc-500">Cargando período...</p>}
+        {db.err && (
+          <div className="mt-2">
+            <p className="text-sm font-black">No se pudo leer parte del historial: {db.err}</p>
+            <div className="mt-2 flex"><Pill onClick={() => setRetry(retry + 1)}>Reintentar</Pill></div>
+          </div>
+        )}
+        {!db.loading && !db.err && rows.length === 0 && <p className="mt-2 text-sm font-bold text-zinc-500">Sin movimientos en este período.</p>}
+        {rows.slice(0, n).map((x, j) => (
+          <div key={x.k} className="py-3" style={j ? { borderTop: "2px solid #000" } : undefined}>
+            <div className="flex items-start justify-between gap-2">
+              <span className="rounded-full px-2.5 py-0.5 text-[11px] font-black text-white" style={{ background: FIN_CATS[x.cat].bg }}>{FIN_CATS[x.cat].l}</span>
+              <span className="flex-none text-sm font-black">{amtTxt(x)}</span>
+            </div>
+            <div className="mt-1 text-sm font-bold leading-snug">{x.t}</div>
+            <div className="mt-0.5 text-xs font-bold text-zinc-600">{fmtDT(x.ts)}{x.s ? ` · ${x.s}` : ""}</div>
+          </div>
+        ))}
+        {rows.length > n && <div className="mt-3 flex"><Pill onClick={() => setN(n + 20)}>{`Ver más (${rows.length - n})`}</Pill></div>}
+      </Card>
+    </div>
   );
 }
 
-function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel, onDelete, hidden = [], onHide }) {
-  const [view, setView] = useState("list");
+function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel, onArchive }) {
   const [f, setF] = useState("all");
-  const isHid = (o) => hidden.includes(o.id);
-  const shown = orders.filter((o) => !isHid(o)), hid = orders.filter(isHid);
-  const base = f === "h" ? hid : shown;
-  const list = base.filter((o) => (f === "all" || f === "h" ? true : f === "x" ? o.c : !o.c && String(o.st) === f));
-  const opts = [["all", "Todos"], ["0", "Pendiente"], ["1", "Listo"], ["2", "En camino"], ["3", "Entregado"], ["x", "Cancelado"], ...(hid.length || f === "h" ? [["h", `Ocultos (${hid.length})`]] : [])];
+  const shown = orders.filter((o) => !o.arch), arch = orders.filter((o) => o.arch);
+  const base = f === "a" ? arch : shown;
+  const list = base.filter((o) => (f === "all" || f === "a" ? true : f === "x" ? o.c : !o.c && String(o.st) === f));
+  const opts = [["all", "Todos"], ["0", "Pendiente"], ["1", "Listo"], ["2", "En camino"], ["3", "Entregado"], ["x", "Cancelado"], ...(arch.length || f === "a" ? [["a", `Archivados (${arch.length})`]] : [])];
   return (
     <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-8 xl:grid-cols-[minmax(0,1fr)_360px]">
       <div className="flex min-w-0 flex-col gap-4">
       <div className="md:max-w-sm"><Cta light onClick={() => openSheet({ k: "new" })}>NUEVO PEDIDO</Cta></div>
-      <Seg dark opts={[["list", "Pedidos"], ["fin", "Finanzas"]]} value={view} onChange={setView} />
-      {view === "fin" ? <FinView orders={orders} members={members} strains={strains} /> : (
-      <>
       <Seg dark opts={opts} value={f} onChange={setF} />
-      {list.length === 0 && <p className="px-1 text-sm font-bold text-zinc-400">{f === "h" ? "No hay pedidos ocultos." : "No hay pedidos en este estado."}</p>}
+      {list.length === 0 && <p className="px-1 text-sm font-bold text-zinc-400">{f === "a" ? "No hay pedidos archivados." : "No hay pedidos en este estado."}</p>}
       <div className="grid grid-cols-1 items-start gap-4 md:grid-cols-2 lg:grid-cols-1 2xl:grid-cols-2">
       {list.map((o) => {
         const m = members.find((x) => x.id === o.m) || GONE_MEMBER;
@@ -1798,14 +1876,11 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
             <div className="mt-3 flex items-center gap-1.5 text-sm font-bold">
               <Clock size={16} strokeWidth={3} /> Despacho {o.h}{o.c ? " • stock liberado" : ""}
             </div>
-            {o.c && (
+            {(o.c || o.st === 3) && (
               <div className="mt-3">
-                <DeleteBtn onClick={() => onDelete(o.id)}>Eliminar permanentemente</DeleteBtn>
-                {o.cAt && <p className="mt-1.5 text-center text-xs font-bold text-zinc-600">Se limpia solo {leftTxt(o.cAt)}</p>}
+                <div className="flex"><Pill icon={o.arch ? ArchiveRestore : Archive} onClick={() => onArchive(o.id, !o.arch)}>{o.arch ? "Restaurar a la lista" : "Archivar"}</Pill></div>
+                {o.c && !o.arch && o.cAt && <p className="mt-1.5 text-center text-xs font-bold text-zinc-600">Se archiva solo {leftTxt(o.cAt)}</p>}
               </div>
-            )}
-            {(o.c || o.st === 3) && onHide && (
-              <div className="mt-3 flex"><Pill icon={isHid(o) ? Eye : EyeOff} onClick={() => onHide(o.id)}>{isHid(o) ? "Mostrar de nuevo" : "Ocultar de la lista"}</Pill></div>
             )}
             {isActive(o) && (
               <div className="mt-3 flex flex-col gap-2.5">
@@ -1820,15 +1895,13 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
         );
       })}
       </div>
-      </>
-      )}
       </div>
       <aside className="hidden lg:sticky lg:top-6 lg:block"><PedidosSummary orders={shown} members={members} /></aside>
     </div>
   );
 }
 
-const TABS = [["gen", "Genéticas", LeafIcon], ["soc", "Socios", Users], ["eq", "Equipo", Shield], ["inv", "Inventario", Package], ["ped", "Pedidos", ClipboardList]];
+const TABS = [["gen", "Genéticas", LeafIcon], ["soc", "Socios", Users], ["eq", "Equipo", Shield], ["inv", "Inventario", Package], ["ped", "Pedidos", ClipboardList], ["fin", "Finanzas", Wallet]];
 
 function ClubLogo() {
   return (
@@ -1878,9 +1951,6 @@ export default function App({ initialTab = "gen" }) {
   const [boot, setBoot] = useState("loading");
   const [bootErr, setBootErr] = useState("");
   const [loginList, setLoginList] = useState([]);
-  /* Pedidos ocultos de la lista diaria: solo se guarda el id en este dispositivo. NO se borra ni se modifica nada en Supabase. */
-  const [hidden, setHidden] = useState(() => load("pedidos_ocultos", []));
-  const toggleHide = (id) => setHidden((h) => { const n = h.includes(id) ? h.filter((x) => x !== id) : [...h, id]; save("pedidos_ocultos", n); return n; });
   const [session, setSession] = useState(null); // { id: <uuid de empleados.id>, token, exp, day } — se completa al iniciar turno o al restaurar la sesión guardada
   const [tab, setTab] = useState(initialTab);
   const [strains, setStrains] = useState([]);
@@ -2012,12 +2082,13 @@ export default function App({ initialTab = "gen" }) {
 
   useEffect(() => {
     if (!me) return;
-    const now = Date.now(), stale = orders.filter((o) => o.c && o.cAt && now - o.cAt > CANCEL_TTL);
+    const now = Date.now(), stale = orders.filter((o) => o.c && !o.arch && o.cAt && now - o.cAt > CANCEL_TTL);
     if (!stale.length) return;
     (async () => {
-      const gone = await ok(supabase.from("pedidos").delete().in("id", stale.map((o) => o.id)).eq("estado", "cancelado").select("id"));
-      if (gone.length) { await note(`limpió ${gone.length} pedido${gone.length > 1 ? "s" : ""} cancelado${gone.length > 1 ? "s" : ""} con más de 2 días (${gone.map((o) => "#" + o.id).join(", ")}).`, { cat: "baja", u: "Sistema" }); await refresh(); }
-    })().catch((e) => console.error("[limpieza de cancelados]", e));
+      // Se marca archivado=true: el pedido NO se borra, solo deja de mostrarse en la lista
+      const done = await ok(supabase.from("pedidos").update({ archivado: true }).in("id", stale.map((o) => o.id)).eq("estado", "cancelado").select("id"));
+      if (done.length) { await note(`archivó automáticamente ${done.length} pedido${done.length > 1 ? "s" : ""} cancelado${done.length > 1 ? "s" : ""} con más de 2 días (${done.map((o) => "#" + o.id).join(", ")}). Los registros se conservan.`, { cat: "sys", u: "Sistema" }); await refresh(); }
+    })().catch((e) => console.error("[archivado automático de cancelados]", e));
   }, [orders, tick, me && me.id]);
 
   const reservedOf = (sid) => r2(orders.filter(isActive).reduce((a, o) => a + gOf(o.items, sid), 0));
@@ -2111,6 +2182,13 @@ export default function App({ initialTab = "gen" }) {
     await sync("Stock y packaging liberados");
   });
 
+  const archive = act(async (oid, flag) => {
+    const o = orders.find((x) => x.id === oid); if (!o || isActive(o)) return; // los pedidos activos no se pueden archivar
+    await upd("pedidos", oid, { archivado: flag }); // UPDATE de un flag: no se borra ningún registro
+    await note(`${flag ? "archivó" : "restauró"} el pedido #${oid} de ${mname(o.m)}${flag ? " (se oculta de la lista; el registro y su importe se conservan)" : ""}.`, { cat: "sys" });
+    await sync(flag ? "Pedido archivado" : "Pedido restaurado");
+  });
+
   const toggleTask = act(async (i) => {
     const t = tasks[i];
     await upd("tareas", t.id, { completada: !t.d });
@@ -2200,12 +2278,6 @@ export default function App({ initialTab = "gen" }) {
     await note(`eliminó el insumo ${p.name}${p.qty > 0 ? ` (se descartaron ${fg(p.qty)} ${u})` : ""}.`, p.qty > 0 ? { cat: "baja", d: { u: -p.qty }, unit: u, before: p.qty, after: 0 } : { cat: "baja" });
     await finish(`${p.name} eliminado`);
   });
-  const delOrder = act(async (oid) => {
-    const o = orders.find((x) => x.id === oid); if (!o || !o.c) return;
-    await del("pedidos", oid);
-    await note(`eliminó permanentemente el pedido cancelado #${oid} del socio ${mname(o.m)}.`, { cat: "baja" });
-    await finish(`Pedido #${oid} eliminado`);
-  });
   const delTask = act(async (ti) => {
     const t = tasks[ti]; if (!t) return;
     await del("tareas", t.id);
@@ -2268,10 +2340,6 @@ export default function App({ initialTab = "gen" }) {
         run: () => delEmp(confirm.i),
       };
     }
-    if (confirm.k === "order") {
-      const o = orders.find((x) => x.id === confirm.id); if (!o) return null;
-      return { question: `¿Estás seguro de eliminar el pedido #${o.id} de ${mname(o.m)}?`, blocked: null, warn: null, run: () => delOrder(o.id) };
-    }
     return null;
   };
   const ci = confirmInfo();
@@ -2327,7 +2395,8 @@ export default function App({ initialTab = "gen" }) {
         {tab === "soc" && <SociosView members={members} openSheet={setSheet} />}
         {tab === "eq" && <EquipoView emps={emps} tasks={tasks} user={user} isAdmin={isAdmin} onLogout={doLogout} log={log} mode={eqMode} setMode={setEqMode} openSheet={setSheet} onTask={toggleTask} onDeleteEmp={(i) => (isAdmin ? setConfirm({ k: "emp", i }) : restricted())} onDeleteTask={askDelTask} />}
         {tab === "inv" && <InvView pack={pack} strains={strains} reservedOf={reservedOf} freeOf={packFree} openSheet={setSheet} onDelete={(id) => setConfirm({ k: "pack", id })} />}
-        {tab === "ped" && <PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onDelete={(id) => setConfirm({ k: "order", id })} hidden={hidden} onHide={toggleHide} />}
+        {tab === "ped" && <PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onArchive={archive} />}
+        {tab === "fin" && <FinanzasView orders={orders} members={members} strains={strains} log={log} />}
       </div>
       </div>
 
@@ -2335,7 +2404,7 @@ export default function App({ initialTab = "gen" }) {
 
       <nav className="fixed bottom-0 left-0 right-0 z-40 mx-auto flex max-w-sm gap-1 px-2 pt-2 md:max-w-3xl lg:hidden" style={{ background: "#0F0F0F", borderTop: `3px solid ${CREAM}`, paddingBottom: "calc(8px + env(safe-area-inset-bottom, 0px))" }}>
         {TABS.map(([k, label, Icon]) => (
-          <button key={k} onClick={() => setTab(k)} className="flex flex-1 flex-col items-center gap-0.5 rounded-2xl py-2 text-xs font-black"
+          <button key={k} onClick={() => setTab(k)} className="flex min-w-0 flex-1 flex-col items-center gap-0.5 rounded-2xl py-2 text-[11px] font-black"
             style={{ background: tab === k ? CREAM : "transparent", color: tab === k ? INK : "#A1A1AA" }}>
             <Icon size={22} strokeWidth={2.8} />
             {label}
