@@ -82,7 +82,7 @@ const fmtWhen = (ts) => {
 const fromEmp = (r) => ({ id: r.id, name: r.nombre, role: r.cargo, kind: r.avatar_svg, admin: r.rol === "admin" });
 const fromStrain = (r) => ({ id: r.id, name: r.nombre, type: r.categoria, stock: num(r.gramos_stock), min: num(r.stock_minimo), max: num(r.stock_maximo), p: num(r.precio_gramo), avatar: nul(r.avatar_svg) });
 const fromMember = (r, mov = []) => ({
-  id: r.id, first: r.nombre, last: r.apellido, active: r.membresia === "activa", grams: num(r.consumo_mes), limit: num(r.limite_mensual), balance: num(r.saldo_cuenta),
+  id: r.id, first: r.nombre, last: r.apellido, arch: !!r.archivado, active: r.membresia === "activa", grams: num(r.consumo_mes), limit: num(r.limite_mensual), balance: num(r.saldo_cuenta),
   avatar: nul(r.avatar_cogollito), addr: { street: r.direccion_calle, zone: r.direccion_zona || "CABA", partido: r.direccion_partido, notes: r.direccion_notas }, mov,
 });
 const fromPack = (r) => ({ id: r.id, name: r.nombre_insumo, unit: r.unidad, qty: num(r.cantidad), min: num(r.cantidad_minima), max: num(r.cantidad_maxima), uc: num(r.costo_unitario) || undefined, k: PACK_K[r.tipo] });
@@ -667,18 +667,18 @@ const BalanceTag = ({ bal }) =>
 const CANCEL_TTL = 2 * 24 * 3600 * 1000;
 const GONE_MEMBER = { id: 0, first: "Socio eliminado", last: "", avatar: undefined };
 
-function DeleteBtn({ children, onClick }) {
+function DeleteBtn({ children, onClick, icon: Icon = Trash2 }) {
   const p = usePress();
   return (
     <button onClick={onClick} {...p} style={{ ...p.style, border: `3px dashed ${INK}`, background: "#fff", color: INK }}
       className="flex w-full items-center justify-center gap-1.5 rounded-full px-3 py-2.5 text-sm font-black">
-      <Trash2 size={18} strokeWidth={3} />
+      <Icon size={18} strokeWidth={3} />
       {children}
     </button>
   );
 }
 
-function ConfirmSheet({ title, question, warn, blocked, onConfirm, onClose }) {
+function ConfirmSheet({ title, question, warn, blocked, soft, onConfirm, onClose }) {
   return (
     <Sheet title={title || (blocked ? "No se puede eliminar" : "Eliminar")} onClose={onClose} z={55} narrow>
       <div className="mt-2 rounded-2xl bg-white p-4" style={line(3)}>
@@ -687,7 +687,7 @@ function ConfirmSheet({ title, question, warn, blocked, onConfirm, onClose }) {
         ) : (
           <>
             <p className="text-lg font-black leading-snug">{question}</p>
-            <p className="mt-1 text-sm font-bold">Esta acción no se puede deshacer.</p>
+            <p className="mt-1 text-sm font-bold">{soft ? "Podés restaurarlo cuando quieras. Su historial, pedidos y cuenta corriente se conservan." : "Esta acción no se puede deshacer."}</p>
             {warn && <div className="mt-3 rounded-xl px-3 py-2 text-sm font-black text-white" style={{ background: INK }}>{warn}</div>}
           </>
         )}
@@ -698,7 +698,7 @@ function ConfirmSheet({ title, question, warn, blocked, onConfirm, onClose }) {
         ) : (
           <>
             <Pill icon={X} onClick={onClose}>Cancelar</Pill>
-            <Pill dark icon={Trash2} onClick={onConfirm}>Sí, eliminar</Pill>
+            <Pill dark icon={soft ? Archive : Trash2} onClick={onConfirm}>{soft ? "Sí, archivar" : "Sí, eliminar"}</Pill>
           </>
         )}
       </div>
@@ -706,7 +706,7 @@ function ConfirmSheet({ title, question, warn, blocked, onConfirm, onClose }) {
   );
 }
 
-function MemberSheet({ m, onPay, onSaveAddr, onDelete, onClose }) {
+function MemberSheet({ m, onPay, onSaveAddr, onDelete, onRestore, onClose }) {
   const [amt, setAmt] = useState("");
   const [edit, setEdit] = useState(false);
   const [ad, setAd] = useState(addrOf(m.addr));
@@ -772,7 +772,7 @@ function MemberSheet({ m, onPay, onSaveAddr, onDelete, onClose }) {
           </div>
         ))}
       </div>
-      <div className="mt-6"><DeleteBtn onClick={() => onDelete(m.id)}>Eliminar socio</DeleteBtn></div>
+      <div className="mt-6">{m.arch ? <div className="flex"><Pill icon={ArchiveRestore} onClick={() => onRestore(m.id)}>Restaurar socio</Pill></div> : <DeleteBtn icon={Archive} onClick={() => onDelete(m.id)}>Archivar socio</DeleteBtn>}</div>
       </div>
       </div>
     </Sheet>
@@ -1354,10 +1354,13 @@ function GenView({ strains, reservedOf, openSheet, onDelete }) {
 }
 
 function SociosView({ members, openSheet }) {
+  const [view, setView] = useState("act");
+  const arch = members.filter((m) => m.arch), list = view === "arch" ? arch : members.filter((m) => !m.arch);
   return (
     <div className="grid grid-cols-1 items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-      {members.length === 0 && <p className="col-span-full px-1 text-sm font-bold text-zinc-400">No hay socios. Tocá + para agregar el primero.</p>}
-      {members.map((m) => (
+      {(arch.length > 0 || view === "arch") && <div className="col-span-full"><Seg dark opts={[["act", "Activos"], ["arch", `Archivados (${arch.length})`]]} value={view} onChange={setView} /></div>}
+      {list.length === 0 && <p className="col-span-full px-1 text-sm font-bold text-zinc-400">{view === "arch" ? "No hay socios archivados." : "No hay socios. Tocá + para agregar el primero."}</p>}
+      {list.map((m) => (
         <button key={m.id} onClick={() => openSheet({ k: "member", id: m.id })}
           className="flex w-full items-center gap-3 rounded-3xl p-3 text-left"
           style={{ ...line(3), background: CREAM, color: INK, boxShadow: "0 0 0 3px #3F3F46" }}>
@@ -1365,7 +1368,7 @@ function SociosView({ members, openSheet }) {
           <div className="min-w-0 flex-1">
             <div className="truncate text-xl font-black leading-tight">{m.first} {m.last}</div>
             <div className="mt-1 flex items-center gap-2">
-              <Tag dark={m.active}>{m.active ? "Activo" : "Vencido"}</Tag>
+              <Tag dark={m.active && !m.arch}>{m.arch ? "Archivado" : m.active ? "Activo" : "Vencido"}</Tag>
               <span className="text-xs font-black">{fg(m.grams)}g / {m.limit}g</span>
             </div>
             <div className="mt-2"><Bar compact value={m.grams} max={m.limit} /></div>
@@ -1743,7 +1746,7 @@ function FinanzasView({ orders: ordersIn, members: membersIn, strains: strainsIn
     return () => { off = true; };
   }, [a0, a1, stamp, retry]);
 
-  const who = (id) => { const m = members.find((x) => x.id === id); return m ? `${m.first}${m.last ? ` ${m.last[0]}.` : ""}` : "Socio eliminado"; };
+  const who = (id) => { const m = members.find((x) => x.id === id); return m ? `${m.first}${m.last ? ` ${m.last[0]}.` : ""}${m.arch ? " (archivado)" : ""}` : "Socio eliminado"; };
   const stName = (id) => (strains.find((x) => x.id === id) || { name: "Genética eliminada" }).name;
   const val = (o) => o?.total || r2((o.items || []).reduce((t, it) => t + it.g * ((strains.find((x) => x.id === it.s) || {}).p || 0), 0));
   const cap = (t) => (t ? t.charAt(0).toUpperCase() + t.slice(1) : "");
@@ -1827,7 +1830,7 @@ function FinanzasView({ orders: ordersIn, members: membersIn, strains: strainsIn
           {members.filter((m) => m.balance !== 0).length === 0 && <p className="mt-2 text-sm font-bold text-zinc-500">Ningún socio tiene deuda ni saldo a favor.</p>}
           {[...members].filter((m) => m.balance !== 0).sort((x, y) => x.balance - y.balance).map((m, j) => (
             <div key={m.id} className="flex items-center justify-between gap-2 py-2.5 text-sm font-black" style={j ? { borderTop: "2px solid #000" } : undefined}>
-              <span className="min-w-0 truncate">{m.first}{m.last ? ` ${m.last[0]}.` : ""}</span>
+              <span className="min-w-0 truncate">{m.first}{m.last ? ` ${m.last[0]}.` : ""}{m.arch ? " (archivado)" : ""}</span>
               <Tag dark={m.balance < 0}>{m.balance < 0 ? `Debe $${money(m.balance)}` : `A favor $${money(m.balance)}`}</Tag>
             </div>
           ))}
@@ -2283,11 +2286,13 @@ export default function App({ initialTab = "gen" }) {
     await note(`eliminó la genética ${s.name}${s.stock > 0 ? ` (se descartaron ${gx(s.stock)}g de stock)` : ""}.`, s.stock > 0 ? { cat: "baja", d: { g: -s.stock }, before: s.stock, after: 0 } : { cat: "baja" });
     await finish(`${s.name} eliminada`);
   });
-  const delMember = act(async (mid) => {
+  const archiveMember = act(async (mid, flag) => {
     const m = members.find((x) => x.id === mid); if (!m) return;
-    await del("socios", mid);
-    await note(`eliminó al socio ${m.first} ${m.last}${m.balance < 0 ? ` (deuda pendiente de $${money(m.balance)})` : m.balance > 0 ? ` (saldo a favor de $${money(m.balance)})` : ""}.`, { cat: "baja" });
-    await finish(`${m.first} eliminado`);
+    await upd("socios", mid, { archivado: flag }); // UPDATE de un flag: pedidos, movimientos y saldo del socio quedan intactos
+    await note(flag
+      ? `archivó al socio ${m.first} ${m.last}${m.balance < 0 ? ` (deuda pendiente de $${money(m.balance)})` : m.balance > 0 ? ` (saldo a favor de $${money(m.balance)})` : ""}. Su historial se conserva.`
+      : `restauró al socio ${m.first} ${m.last}.`, { cat: flag ? "baja" : "socio" });
+    await finish(`${m.first} ${flag ? "archivado" : "restaurado"}`);
   });
   const delPack = act(async (id) => {
     const p = packOf(id); if (!p) return;
@@ -2330,10 +2335,11 @@ export default function App({ initialTab = "gen" }) {
       const m = members.find((x) => x.id === confirm.id); if (!m) return null;
       const act = activeWith((o) => o.m === m.id);
       return {
-        question: `¿Estás seguro de eliminar a ${m.first} ${m.last}?`,
-        blocked: act.length ? `${m.first} tiene ${act.length} ${plural(act.length, "pedido")} ${plural(act.length, "activo")} (${ids(act)}). Entregalos o cancelalos antes de eliminar al socio.` : null,
-        warn: m.balance < 0 ? `Tiene una deuda de $${money(m.balance)} sin cobrar: se pierde su cuenta corriente.` : m.balance > 0 ? `Tiene $${money(m.balance)} a favor: se pierde su cuenta corriente.` : null,
-        run: () => delMember(m.id),
+        title: "Archivar socio", soft: true,
+        question: `¿Archivar a ${m.first} ${m.last}?`,
+        blocked: act.length ? `${m.first} tiene ${act.length} ${plural(act.length, "pedido")} ${plural(act.length, "activo")} (${ids(act)}). Entregalos o cancelalos antes de archivar al socio.` : null,
+        warn: m.balance < 0 ? `Tiene una deuda de $${money(m.balance)} sin cobrar: la cuenta corriente se conserva.` : m.balance > 0 ? `Tiene $${money(m.balance)} a favor: la cuenta corriente se conserva.` : null,
+        run: () => archiveMember(m.id, true),
       };
     }
     if (confirm.k === "pack") {
@@ -2371,7 +2377,7 @@ export default function App({ initialTab = "gen" }) {
   const debt = r2(members.filter((m) => m.balance < 0).reduce((a, m) => a - m.balance, 0));
   const HEAD = {
     gen: ["Genéticas", `${fg(total)}g en ${strains.length} cepas`],
-    soc: ["Socios", `${members.length} socios • deuda total $${fg(debt)}`],
+    soc: ["Socios", `${members.filter((m) => !m.arch).length} socios • deuda total $${fg(debt)}`],
     eq: ["Equipo", `Sesión: ${me.name} • ${me.admin ? "Administrador" : me.role}`],
     inv: ["Inventario", lowPack ? `${lowPack} material${lowPack > 1 ? "es" : ""} en mínimo` : "Todo en orden"],
     ped: ["Pedidos", `${activeOrders} pedidos activos hoy`],
@@ -2438,11 +2444,11 @@ export default function App({ initialTab = "gen" }) {
         </div>
       )}
 
-      {sheet && sheet.k === "out" && ss && <OutSheet strain={ss} members={members} avail={availOf(ss.id)} onConfirm={(g, mid, paid) => doOut(ss.id, mid, g, paid)} onClose={close} />}
+      {sheet && sheet.k === "out" && ss && <OutSheet strain={ss} members={members.filter((m) => !m.arch)} avail={availOf(ss.id)} onConfirm={(g, mid, paid) => doOut(ss.id, mid, g, paid)} onClose={close} />}
       {sheet && sheet.k === "merma" && ss && <MermaSheet strain={ss} avail={availOf(ss.id)} onConfirm={(g, why) => doMerma(ss.id, g, why)} onClose={close} />}
       {sheet && sheet.k === "ingreso" && ss && <IngresoSheet strain={ss} onConfirm={(g, lote) => doIngreso(ss.id, g, lote)} onClose={close} />}
-      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={(id) => setCi({ title: "Eliminar socio", question: "¿Estás seguro de eliminar a este socio?", run: () => delMember(id) })} onClose={close} />}
-      {sheet && sheet.k === "new" && <OrderSheet strains={strains} members={members} avail={availOf} onConfirm={newOrder} onClose={close} />}
+      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={(id) => setConfirm({ k: "member", id })} onRestore={(id) => archiveMember(id, false)} onClose={close} />}
+      {sheet && sheet.k === "new" && <OrderSheet strains={strains} members={members.filter((m) => !m.arch)} avail={availOf} onConfirm={newOrder} onClose={close} />}
       {sheet && sheet.k === "add" && <OrderSheet strains={strains} members={members} avail={availOf} orderId={sheet.oid} onConfirm={(v) => addItem(sheet.oid, v)} onClose={close} />}
       {sheet && sheet.k === "session" && <SessionSheet me={me} onLogout={doLogout} onClose={close} />}
       {sheet && sheet.k === "addStrain" && <AddStrainSheet strains={strains} onConfirm={addStrain} onClose={close} />}
@@ -2453,7 +2459,7 @@ export default function App({ initialTab = "gen" }) {
       {sheet && sheet.k === "addPack" && <AddPackSheet onConfirm={addPack} onClose={close} />}
       {sheet && sheet.k === "packUse" && sp && <UseSheet p={sp} free={packFree(sp)} onConfirm={(q, why) => doPackUse(sp.id, q, why)} onClose={close} />}
       {sheet && sheet.k === "packRestock" && sp && <RestockSheet p={sp} onConfirm={(v) => doRestock(sp.id, v)} onClose={close} />}
-      {ci && <ConfirmSheet title={ci.title} question={ci.question} warn={ci.warn} blocked={ci.blocked} onConfirm={ci.run} onClose={() => setConfirm(null)} />}
+      {ci && <ConfirmSheet title={ci.title} question={ci.question} warn={ci.warn} blocked={ci.blocked} soft={ci.soft} onConfirm={ci.run} onClose={() => setConfirm(null)} />}
       {sheet && sheet.k === "packEdit" && sp && <EditPackSheet p={sp} onConfirm={(v) => doEditPack(sp.id, v)} onClose={close} />}
     </div>
   );
