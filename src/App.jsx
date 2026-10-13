@@ -1,6 +1,6 @@
 import { useState, useId, useEffect, useRef, useCallback } from "react";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2 } from "lucide-react";
+import { PackagePlus, Scale, Info, Wallet, KeyRound, EyeOff, Check, Plus, Minus, Leaf as LeafIcon, Users, Shield, Package, ClipboardList, X, ChevronRight, Clock, ShoppingBag, FlaskConical, Tag as TagIcon, Ban, Search, MapPin, Pencil, Trash2, LogOut, Loader2, Eye, ChevronLeft } from "lucide-react";
 
 /* ═════════════ SUPABASE ═════════════
    La clave "publishable" es pública por diseño: la seguridad real la dan las políticas RLS.
@@ -68,6 +68,12 @@ const PACK_K = { bolsa: "bag", frasco: "jar", caja: "box", etiqueta: "lab", nutr
 const packTipo = (n = "") => /bolsa|ziploc/i.test(n) ? "bolsa" : /frasco/i.test(n) ? "frasco" : /caja/i.test(n) ? "caja" : /etiqueta/i.test(n) ? "etiqueta" : /nutri/i.test(n) ? "nutriente" : /sustrato/i.test(n) ? "sustrato" : "otro";
 const isPk = (p) => p.k === "bag" || p.k === "box"; // bolsas y cajas se descuentan en cada entrega
 const DIAS = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+const p2 = (n) => String(n).padStart(2, "0");
+const parseTs = (v) => { const t = v ? Date.parse(v) : NaN; return Number.isNaN(t) ? undefined : t; };
+const fmtDT = (ts) => { const d = new Date(ts); return ts == null || Number.isNaN(d.getTime()) ? "—" : `${p2(d.getDate())}/${p2(d.getMonth() + 1)}/${d.getFullYear()} ${p2(d.getHours())}:${p2(d.getMinutes())}`; };
+const MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+const monthIdx = (ts) => { const d = new Date(ts); return d.getFullYear() * 12 + d.getMonth(); }; // índice absoluto de mes
+const monthLabel = (k) => `${MESES[k % 12]} ${Math.floor(k / 12)}`;
 const fmtWhen = (ts) => {
   const d = new Date(ts), t = new Date(), hm = d.toTimeString().slice(0, 5);
   const diff = Math.round((new Date(t.getFullYear(), t.getMonth(), t.getDate()) - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 864e5);
@@ -83,7 +89,7 @@ const fromPack = (r) => ({ id: r.id, name: r.nombre_insumo, unit: r.unidad, qty:
 const fromOrder = (r) => {
   const a = r.direccion_entrega || {};
   return {
-    id: r.id, m: r.socio_id ?? 0, items: (r.items_json || []).map((i) => ({ s: i.genetica_id, g: num(i.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega,
+    id: r.id, m: r.socio_id ?? 0, items: (r.items_json || []).map((i) => ({ s: i.genetica_id, g: num(i.gramos) })), st: Math.max(0, ESTADOS.indexOf(r.estado)), h: r.hora_entrega, ts: parseTs(r.created_at ?? r.creado_en), total: num(r.total),
     c: r.estado === "cancelado", cAt: r.cancelado_en ? Date.parse(r.cancelado_en) : undefined, addr: a.street ? a : undefined, alt: r.es_alternativa,
   };
 };
@@ -114,7 +120,7 @@ const loadAll = async () => {
   ]);
   const emps = E.map(fromEmp), kinds = {}, movs = {};
   emps.forEach((e) => { kinds[e.id] = e.kind; kinds[e.name] = e.kind; });
-  MV.forEach((r) => (movs[r.socio_id] ||= []).push({ t: fmtWhen(r.creado_en), txt: r.descripcion, amt: num(r.monto) }));
+  MV.forEach((r) => (movs[r.socio_id] ||= []).push({ t: fmtDT(r.creado_en), ts: parseTs(r.creado_en), txt: r.descripcion, amt: num(r.monto) }));
   return {
     emps, strains: G.map(fromStrain), members: S.map((r) => fromMember(r, movs[r.id])), pack: I.map(fromPack),
     orders: P.map(fromOrder), tasks: T.map((r) => fromTask(r, emps)), log: L.map((r) => fromLog(r, kinds)),
@@ -1377,7 +1383,7 @@ function SociosView({ members, openSheet }) {
 const gx = (x) => (Number.isInteger(r2(x)) ? r2(x).toFixed(1) : String(r2(x)));
 const money = (v) => Math.abs(v).toLocaleString("es-AR", { maximumFractionDigits: 2 });
 const norm = (t = "") => String(t).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-const fmtTs = (ts) => new Date(ts).toLocaleString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const fmtTs = (ts) => fmtDT(ts); // DD/MM/YYYY HH:mm
 const CATS = {
   out: { label: "SALIDA / MOSTRADOR", bg: "#16A34A" },
   merma: { label: "MERMA / AJUSTE", bg: "#EA580C" },
@@ -1680,15 +1686,96 @@ function PedidosSummary({ orders, members }) {
   );
 }
 
-function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel, onDelete }) {
+/* Historial financiero por mes/día. Lee TODOS los pedidos (también los ocultos): ocultar no afecta ningún total. */
+function FinView({ orders, members, strains }) {
+  const cur = monthIdx(Date.now());
+  const dated = orders.filter((o) => o.ts);
+  const movs = members.flatMap((m) => (m.mov || []).filter((x) => x.ts));
+  const keys = [...new Set([cur, ...dated.map((o) => monthIdx(o.ts)), ...movs.map((x) => monthIdx(x.ts))])].sort((a, b) => b - a);
+  const [k, setK] = useState(cur), [day, setDay] = useState(""), [n, setN] = useState(10);
+  const go = (nk) => { setK(nk); setDay(""); setN(10); };
+  const i = keys.indexOf(k), older = keys[i + 1], newer = keys[i - 1];
+  const dOf = (ts) => new Date(ts).getDate();
+  const pickDay = (x) => !day || dOf(x.ts) === Number(day);
+  const ordM = dated.filter((o) => monthIdx(o.ts) === k), movM = movs.filter((x) => monthIdx(x.ts) === k);
+  const days = [...new Set([...ordM.map((o) => dOf(o.ts)), ...movM.map((x) => dOf(x.ts))])].sort((a, b) => b - a);
+  const ord = ordM.filter(pickDay).sort((a, b) => b.ts - a.ts), mv = movM.filter(pickDay);
+  const val = (o) => o.total || r2(o.items.reduce((t, it) => t + it.g * ((strains.find((s) => s.id === it.s) || {}).p || 0), 0));
+  const done = ord.filter((o) => !o.c && o.st === 3);
+  const fact = r2(done.reduce((a, o) => a + val(o), 0));
+  const grams = r2(done.reduce((a, o) => a + o.items.reduce((t, it) => t + it.g, 0), 0));
+  const fiado = r2(mv.filter((x) => x.amt < 0).reduce((a, x) => a - x.amt, 0));
+  const cobrado = r2(mv.filter((x) => x.amt > 0).reduce((a, x) => a + x.amt, 0));
+  const noDate = orders.length - dated.length;
+  const sel = { border: `3px solid ${INK}`, background: "#fff", color: INK };
+  const navBtn = (dis) => ({ ...line(3), background: "#fff", opacity: dis ? 0.3 : 1 });
+  const stat = (label, v) => (
+    <div className="rounded-2xl p-3" style={line(2)}>
+      <div className="text-xs font-black uppercase tracking-wide text-zinc-600">{label}</div>
+      <div className="mt-0.5 text-xl font-black leading-tight">{v}</div>
+    </div>
+  );
+  return (
+    <Card>
+      <h3 className="text-2xl font-black tracking-tight">Finanzas</h3>
+      <div className="mt-3 flex items-center gap-2">
+        <button aria-label="Mes anterior" disabled={older == null} onClick={() => go(older)} className="flex h-11 w-11 flex-none items-center justify-center rounded-full" style={navBtn(older == null)}><ChevronLeft size={22} strokeWidth={3} /></button>
+        <select aria-label="Mes" value={k} onChange={(e) => go(Number(e.target.value))} className="h-11 min-w-0 flex-1 rounded-full px-3 text-sm font-black" style={sel}>
+          {keys.map((x) => <option key={x} value={x}>{monthLabel(x)}</option>)}
+        </select>
+        <button aria-label="Mes siguiente" disabled={newer == null} onClick={() => go(newer)} className="flex h-11 w-11 flex-none items-center justify-center rounded-full" style={navBtn(newer == null)}><ChevronRight size={22} strokeWidth={3} /></button>
+      </div>
+      <select aria-label="Día" value={day} onChange={(e) => { setDay(e.target.value); setN(10); }} className="mt-2 h-11 w-full rounded-full px-3 text-sm font-black" style={sel}>
+        <option value="">Todo el mes</option>
+        {days.map((d) => <option key={d} value={d}>{`${p2(d)}/${p2((k % 12) + 1)}/${Math.floor(k / 12)}`}</option>)}
+      </select>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {stat("Facturado", `$${money(fact)}`)}
+        {stat("Consumido", `${fg(grams)} g`)}
+        {stat("Fiado", `$${money(fiado)}`)}
+        {stat("Cobrado", `$${money(cobrado)}`)}
+      </div>
+      <p className="mt-2 text-xs font-bold text-zinc-600">Facturado y consumido: solo pedidos entregados. Fiado y cobrado: movimientos de cuenta de socios.</p>
+      <div className="mb-1 mt-4 text-sm font-black">Pedidos del período ({ord.length})</div>
+      {ord.length === 0 && <p className="text-sm font-bold text-zinc-500">Sin pedidos en este período.</p>}
+      {ord.slice(0, n).map((o, j) => {
+        const m = members.find((x) => x.id === o.m) || GONE_MEMBER;
+        return (
+          <div key={o.id} className={`py-2.5 ${o.c ? "opacity-50" : ""}`} style={j ? { borderTop: "2px solid #000" } : undefined}>
+            <div className="flex items-center justify-between gap-2 text-sm font-black">
+              <span className={`min-w-0 truncate ${o.c ? "line-through" : ""}`}>#{o.id} {m.first}{m.last ? ` ${m.last[0]}.` : ""}</span>
+              <span className="flex-none">${money(val(o))}</span>
+            </div>
+            <div className="mt-0.5 flex items-center justify-between gap-2 text-xs font-bold text-zinc-600">
+              <span>{fmtDT(o.ts)} • {fg(o.items.reduce((t, it) => t + it.g, 0))}g</span>
+              <span className="flex-none">{o.c ? "Cancelado" : ST[o.st]}</span>
+            </div>
+          </div>
+        );
+      })}
+      {ord.length > n && <div className="mt-2 flex"><Pill onClick={() => setN(n + 10)}>{`Ver más (${ord.length - n})`}</Pill></div>}
+      {noDate > 0 && <p className="mt-3 text-xs font-bold text-zinc-500">{noDate} {noDate === 1 ? "pedido sin fecha" : "pedidos sin fecha"} (created_at vacío): no entra en ningún mes.</p>}
+    </Card>
+  );
+}
+
+function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel, onDelete, hidden = [], onHide }) {
+  const [view, setView] = useState("list");
   const [f, setF] = useState("all");
-  const list = orders.filter((o) => (f === "all" ? true : f === "x" ? o.c : !o.c && String(o.st) === f));
+  const isHid = (o) => hidden.includes(o.id);
+  const shown = orders.filter((o) => !isHid(o)), hid = orders.filter(isHid);
+  const base = f === "h" ? hid : shown;
+  const list = base.filter((o) => (f === "all" || f === "h" ? true : f === "x" ? o.c : !o.c && String(o.st) === f));
+  const opts = [["all", "Todos"], ["0", "Pendiente"], ["1", "Listo"], ["2", "En camino"], ["3", "Entregado"], ["x", "Cancelado"], ...(hid.length || f === "h" ? [["h", `Ocultos (${hid.length})`]] : [])];
   return (
     <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-8 xl:grid-cols-[minmax(0,1fr)_360px]">
       <div className="flex min-w-0 flex-col gap-4">
       <div className="md:max-w-sm"><Cta light onClick={() => openSheet({ k: "new" })}>NUEVO PEDIDO</Cta></div>
-      <Seg dark opts={[["all", "Todos"], ["0", "Pendiente"], ["1", "Listo"], ["2", "En camino"], ["3", "Entregado"], ["x", "Cancelado"]]} value={f} onChange={setF} />
-      {list.length === 0 && <p className="px-1 text-sm font-bold text-zinc-400">No hay pedidos en este estado.</p>}
+      <Seg dark opts={[["list", "Pedidos"], ["fin", "Finanzas"]]} value={view} onChange={setView} />
+      {view === "fin" ? <FinView orders={orders} members={members} strains={strains} /> : (
+      <>
+      <Seg dark opts={opts} value={f} onChange={setF} />
+      {list.length === 0 && <p className="px-1 text-sm font-bold text-zinc-400">{f === "h" ? "No hay pedidos ocultos." : "No hay pedidos en este estado."}</p>}
       <div className="grid grid-cols-1 items-start gap-4 md:grid-cols-2 lg:grid-cols-1 2xl:grid-cols-2">
       {list.map((o) => {
         const m = members.find((x) => x.id === o.m) || GONE_MEMBER;
@@ -1698,7 +1785,10 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
               <MemberAvatar id={m.id} name={m.first} avatar={m.avatar} size={60} />
               <div className="min-w-0 flex-1">
                 <div className={`truncate text-xl font-black leading-tight ${o.c ? "line-through" : ""}`}>#{o.id} {m.first}{m.last ? ` ${m.last[0]}.` : ""}</div>
-                <div className="mt-1"><Tag dark={!o.c && o.st >= 2}>{o.c ? "Cancelado" : ST[o.st]}</Tag></div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <Tag dark={!o.c && o.st >= 2}>{o.c ? "Cancelado" : ST[o.st]}</Tag>
+                  <span className="text-xs font-bold text-zinc-600">{fmtDT(o.ts)}</span>
+                </div>
               </div>
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
@@ -1706,13 +1796,16 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
             </div>
             <div className={o.c ? "opacity-50" : ""}><DestBox a={o.addr || m.addr} alt={o.alt} /></div>
             <div className="mt-3 flex items-center gap-1.5 text-sm font-bold">
-              <Clock size={16} strokeWidth={3} /> Despacho {o.h} • Cadete: Tomás{o.c ? " • stock liberado" : ""}
+              <Clock size={16} strokeWidth={3} /> Despacho {o.h}{o.c ? " • stock liberado" : ""}
             </div>
             {o.c && (
               <div className="mt-3">
                 <DeleteBtn onClick={() => onDelete(o.id)}>Eliminar permanentemente</DeleteBtn>
                 {o.cAt && <p className="mt-1.5 text-center text-xs font-bold text-zinc-600">Se limpia solo {leftTxt(o.cAt)}</p>}
               </div>
+            )}
+            {(o.c || o.st === 3) && onHide && (
+              <div className="mt-3 flex"><Pill icon={isHid(o) ? Eye : EyeOff} onClick={() => onHide(o.id)}>{isHid(o) ? "Mostrar de nuevo" : "Ocultar de la lista"}</Pill></div>
             )}
             {isActive(o) && (
               <div className="mt-3 flex flex-col gap-2.5">
@@ -1727,8 +1820,10 @@ function PedidosView({ orders, members, strains, openSheet, onAdvance, onCancel,
         );
       })}
       </div>
+      </>
+      )}
       </div>
-      <aside className="hidden lg:sticky lg:top-6 lg:block"><PedidosSummary orders={orders} members={members} /></aside>
+      <aside className="hidden lg:sticky lg:top-6 lg:block"><PedidosSummary orders={shown} members={members} /></aside>
     </div>
   );
 }
@@ -1783,6 +1878,9 @@ export default function App({ initialTab = "gen" }) {
   const [boot, setBoot] = useState("loading");
   const [bootErr, setBootErr] = useState("");
   const [loginList, setLoginList] = useState([]);
+  /* Pedidos ocultos de la lista diaria: solo se guarda el id en este dispositivo. NO se borra ni se modifica nada en Supabase. */
+  const [hidden, setHidden] = useState(() => load("pedidos_ocultos", []));
+  const toggleHide = (id) => setHidden((h) => { const n = h.includes(id) ? h.filter((x) => x !== id) : [...h, id]; save("pedidos_ocultos", n); return n; });
   const [session, setSession] = useState(null); // { id: <uuid de empleados.id>, token, exp, day } — se completa al iniciar turno o al restaurar la sesión guardada
   const [tab, setTab] = useState(initialTab);
   const [strains, setStrains] = useState([]);
@@ -2229,7 +2327,7 @@ export default function App({ initialTab = "gen" }) {
         {tab === "soc" && <SociosView members={members} openSheet={setSheet} />}
         {tab === "eq" && <EquipoView emps={emps} tasks={tasks} user={user} isAdmin={isAdmin} onLogout={doLogout} log={log} mode={eqMode} setMode={setEqMode} openSheet={setSheet} onTask={toggleTask} onDeleteEmp={(i) => (isAdmin ? setConfirm({ k: "emp", i }) : restricted())} onDeleteTask={askDelTask} />}
         {tab === "inv" && <InvView pack={pack} strains={strains} reservedOf={reservedOf} freeOf={packFree} openSheet={setSheet} onDelete={(id) => setConfirm({ k: "pack", id })} />}
-        {tab === "ped" && <PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onDelete={(id) => setConfirm({ k: "order", id })} />}
+        {tab === "ped" && <PedidosView orders={orders} members={members} strains={strains} openSheet={setSheet} onAdvance={advance} onCancel={cancel} onDelete={(id) => setConfirm({ k: "order", id })} hidden={hidden} onHide={toggleHide} />}
       </div>
       </div>
 
@@ -2254,7 +2352,7 @@ export default function App({ initialTab = "gen" }) {
       {sheet && sheet.k === "out" && ss && <OutSheet strain={ss} members={members} avail={availOf(ss.id)} onConfirm={(g, mid, paid) => doOut(ss.id, mid, g, paid)} onClose={close} />}
       {sheet && sheet.k === "merma" && ss && <MermaSheet strain={ss} avail={availOf(ss.id)} onConfirm={(g, why) => doMerma(ss.id, g, why)} onClose={close} />}
       {sheet && sheet.k === "ingreso" && ss && <IngresoSheet strain={ss} onConfirm={(g, lote) => doIngreso(ss.id, g, lote)} onClose={close} />}
-      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={(id) => setConfirm({ k: "member", id })} onClose={close} />}
+      {sm && <MemberSheet m={sm} onPay={doPay} onSaveAddr={saveAddr} onDelete={(id) => setCi({ title: "Eliminar socio", question: "¿Estás seguro de eliminar a este socio?", run: () => delMember(id) })} onClose={close} />}
       {sheet && sheet.k === "new" && <OrderSheet strains={strains} members={members} avail={availOf} onConfirm={newOrder} onClose={close} />}
       {sheet && sheet.k === "add" && <OrderSheet strains={strains} members={members} avail={availOf} orderId={sheet.oid} onConfirm={(v) => addItem(sheet.oid, v)} onClose={close} />}
       {sheet && sheet.k === "session" && <SessionSheet me={me} onLogout={doLogout} onClose={close} />}
